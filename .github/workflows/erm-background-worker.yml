@@ -1,0 +1,35 @@
+name: ERM Background Worker
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'     # Every 30 minutes (change to '0 * * * *' for hourly)
+  workflow_dispatch:           # Allows manual trigger from GitHub
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ERM Background Worker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python erm_background_worker.py
+
+      - name: Commit & Push any new data
+        run: |
+          git config user.name "ERM Bot"
+          git config user.email "erm-bot@github.com"
+          git add ERM_Data/
+          git commit -m "ERM auto-backup $(date +'%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+          git push
