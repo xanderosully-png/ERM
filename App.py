@@ -100,16 +100,13 @@ def fetch_data(lat, lon, tz):
     except Exception:
         return None
 
-# ====================== LOAD FROM GITHUB (always fresh) ======================
-@st.cache_data(ttl=300)  # refresh every 5 minutes
+@st.cache_data(ttl=300)
 def load_erm_data(github_repo: str):
-    """Fetch latest ERM_Data CSVs directly from GitHub raw"""
     data_dir_url = f"https://api.github.com/repos/{github_repo}/contents/ERM_Data"
     try:
         resp = requests.get(data_dir_url)
         resp.raise_for_status()
         files = resp.json()
-        
         city_data = {}
         for file in files:
             if file["type"] == "file" and file["name"].endswith(".csv") and file["name"].startswith("erm_v"):
@@ -117,31 +114,24 @@ def load_erm_data(github_repo: str):
                 df = pd.read_csv(raw_url)
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df = df.sort_values('timestamp')
-                
-                # Extract city name from filename (robust)
                 stem = file["name"].replace(".csv", "")
                 parts = stem.split("_")
                 city_key = "_".join(parts[2:-1]) if len(parts) > 3 else parts[2]
-                
                 if city_key not in city_data:
                     city_data[city_key] = []
                 city_data[city_key].append(df)
-        
-        # Merge all daily files per city
         for city in city_data:
             city_data[city] = pd.concat(city_data[city], ignore_index=True).drop_duplicates(subset='timestamp').sort_values('timestamp')
-        
         return city_data
     except Exception:
         return {}
 
-# ====================== STREAMLIT UI ======================
 st.set_page_config(page_title=f"ERM v{VERSION} Live", page_icon="🌡️", layout="wide")
 st.title("🌍 ERM v4.4 — Live Adaptive Weather Predictor + Saved ERM_Data")
 
 with st.sidebar:
     st.header("Controls")
-    github_repo = st.text_input("GitHub Repo (username/repo)", value="YOURUSERNAME/YOURREPO", help="So the app can pull the latest ERM_Data from GitHub")
+    github_repo = st.text_input("GitHub Repo (username/repo)", value="YOURUSERNAME/YOURREPO", help="Enter your exact GitHub repo so Saved mode can load ERM_Data")
     
     available = [c["name"] for c in DEFAULT_CITIES]
     selected = st.multiselect("Cities (Live mode)", available, default=["Columbus_OH"])
@@ -153,84 +143,4 @@ with st.sidebar:
         interval_min = st.slider("Update every (minutes)", 1, 60, 5)
         auto_refresh = st.toggle("Auto-refresh", value=True)
         if st.button("🔄 Update Now", type="primary", use_container_width=True):
-            st.session_state.force_update = True
-    else:
-        st.info("📁 Loading latest data from GitHub ERM_Data/ (auto-refreshes every 5 min)")
-
-def to_unit(temp_c, unit):
-    return round(temp_c * 9/5 + 32, 1) if unit == "°F" else round(temp_c, 1)
-
-# Session state for Live
-if "erms_live" not in st.session_state:
-    st.session_state.erms_live = {name: ERM_Live_Adaptive() for name in selected}
-    st.session_state.previous_live = {name: None for name in selected}
-    st.session_state.history_live = {name: [] for name in selected}
-
-active_cities = [c for c in DEFAULT_CITIES if c["name"] in selected]
-
-if mode == "Live":
-    # Live mode (unchanged from previous versions)
-    cols = st.columns(min(len(active_cities), 4))
-    for idx, city in enumerate(active_cities):
-        name = city["name"]
-        data = fetch_data(city["lat"], city["lon"], city["tz"])
-        if data:
-            # ... (exact same live code as before - omitted for brevity, but it's the full live block you already have)
-            # (live_temp_c, step, predictions, metrics, chart, etc.)
-            pass  # replace this comment with your existing live mode code if you prefer, or keep the full block from my previous message
-        else:
-            with cols[idx % len(cols)]:
-                st.error(f"❌ {name} — API unavailable")
-
-else:
-    # Saved ERM_Data mode - now pulls fresh from GitHub
-    erm_data = load_erm_data(github_repo)
-    
-    if not erm_data:
-        st.warning("No ERM_Data files found yet. The background worker will create them shortly.")
-    else:
-        st.success(f"✅ Loaded {len(erm_data)} cities from GitHub ERM_Data/")
-        
-        selected_saved_city = st.selectbox("Select city to view saved data", options=list(erm_data.keys()))
-        
-        if selected_saved_city:
-            df = erm_data[selected_saved_city]
-            st.subheader(f"📊 Saved Historical Data — {selected_saved_city.replace('_', ' ')}")
-            st.caption(f"Total records: {len(df):,} | Range: {df['timestamp'].min().date()} – {df['timestamp'].max().date()}")
-            
-            # Full prediction chart
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df["timestamp"], y=df["live_temp"], name="Actual Temp", line=dict(color="#1f77b4", width=3)))
-            for col in [c for c in df.columns if c.startswith("next_predicted_")]:
-                hours = col.split("_")[-1].replace("h", "")
-                fig.add_trace(go.Scatter(x=df["timestamp"], y=df[col], name=f"{hours}h ERM Pred", line=dict(dash="dash")))
-            fig.update_layout(title="Temperature + ERM Predictions", height=500, xaxis_title="Time", yaxis_title="°C")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Improvement %
-            fig_imp = go.Figure()
-            fig_imp.add_trace(go.Scatter(x=df["timestamp"], y=df["improvement_pct"], name="% Improvement", line=dict(color="#2ca02c")))
-            fig_imp.update_layout(title="ERM Improvement over Baseline", height=300, xaxis_title="Time", yaxis_title="%")
-            st.plotly_chart(fig_imp, use_container_width=True)
-            
-            st.dataframe(df, use_container_width=True)
-
-# Shared downloads
-with st.expander("📥 Downloads & Log"):
-    if st.button("Download all data as ZIP"):
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for file_url in [f"https://raw.githubusercontent.com/{github_repo}/main/ERM_Data/{f}" for f in Path("ERM_Data").glob("*.csv") if False]:  # placeholder - we can expand later
-                pass  # full ZIP logic can be added if needed
-        st.download_button("⬇️ Download ZIP", zip_buffer.getvalue(), "ERM_full_data.zip", "application/zip")
-
-# Auto-refresh
-if mode == "Live" and auto_refresh:
-    if "last_update" not in st.session_state:
-        st.session_state.last_update = time.time()
-    if time.time() - st.session_state.last_update > interval_min * 60 or st.session_state.get("force_update"):
-        st.session_state.last_update = time.time()
-        st.session_state.force_update = False
-        st.rerun()
-
-st.caption("🚀 ERM v4.4 • Live + GitHub-backed ERM_Data mode • Fully synced with background worker")
+            st.session_state.force_update =
