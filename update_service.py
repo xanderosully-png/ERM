@@ -118,13 +118,13 @@ def git_backup(data_dir: Path):
         print("ERROR: GITHUB_TOKEN or GITHUB_REPO is missing!")
         return
     try:
-        # Force initialize git every time
+        # Force initialize git repo
         if not (data_dir.parent / ".git").exists():
             subprocess.run(["git", "init"], cwd=data_dir.parent, check=True, capture_output=True)
             print("✅ Git repo initialized")
         remote_url = f"https://{token}@github.com/{repo}.git"
         subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True, capture_output=True)
-        print("✅ Remote URL set")
+        print("✅ Remote URL set with token")
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
         print("✅ Git config set")
