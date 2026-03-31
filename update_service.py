@@ -79,7 +79,13 @@ class ERM_Live_Adaptive:
         return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in steps_list}
 
 def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
-    params = {"latitude": lat, "longitude": lon, "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure", "daily": "temperature_2m_max,temperature_2m_min", "timezone": timezone}
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": timezone
+    }
     for attempt in range(3):
         try:
             resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
@@ -87,19 +93,39 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
             data = resp.json()
             current = data['current']
             daily = data['daily']
-            return {'temp': current['temperature_2m'], 'humidity': current['relative_humidity_2m'], 'wind': current['wind_speed_10m'], 'pressure': current['surface_pressure'], 'time': datetime.now().isoformat(), 'tomorrow_max': daily['temperature_2m_max'][1], 'tomorrow_min': daily['temperature_2m_min'][1]}
+            return {
+                'temp': current['temperature_2m'],
+                'humidity': current['relative_humidity_2m'],
+                'wind': current['wind_speed_10m'],
+                'pressure': current['surface_pressure'],
+                'time': datetime.now().isoformat(),
+                'tomorrow_max': daily['temperature_2m_max'][1],
+                'tomorrow_min': daily['temperature_2m_min'][1]
+            }
         except Exception:
             if attempt < 2:
                 time.sleep(2 ** attempt)
     return None
 
 def git_backup(data_dir: Path):
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        print("ERROR: GITHUB_TOKEN environment variable is not set!")
+        return
     try:
+        repo_url = f"https://{token}@github.com/{os.getenv('GITHUB_REPO', 'YOURUSERNAME/YOURREPO')}.git"
+        subprocess.run(["git", "remote", "set-url", "origin", repo_url], check=True, capture_output=True)
+        subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
         subprocess.run(["git", "add", str(data_dir)], check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], check=True, capture_output=True)
-        subprocess.run(["git", "push"], check=True, capture_output=True)
-    except Exception:
-        pass
+        commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], capture_output=True, text=True)
+        if commit_result.returncode == 0:
+            push_result = subprocess.run(["git", "push"], capture_output=True, text=True)
+            print("✅ GitHub backup successful")
+        else:
+            print("No changes to commit")
+    except Exception as e:
+        print(f"Git backup error: {e}")
 
 @app.get("/update")
 async def update_data():
@@ -131,7 +157,11 @@ async def update_data():
         else:
             improvement = 0.0
 
-        Er_flux, next_predicted, beta = erm.step(live_temp, data['humidity'], data['wind'], data['pressure'], prev['live_temp'] if prev else None, hour_of_day, city['local_avg_temp'], city['local_temp_range'])
+        Er_flux, next_predicted, beta = erm.step(
+            live_temp, data['humidity'], data['wind'], data['pressure'],
+            prev['live_temp'] if prev else None,
+            hour_of_day, city['local_avg_temp'], city['local_temp_range']
+        )
 
         future = erm.predict_future([1, 3, 6, 12, 24, 48])
 
