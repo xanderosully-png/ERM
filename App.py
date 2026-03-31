@@ -11,8 +11,8 @@ import zipfile
 
 VERSION = "4.4"
 
-# ==================== YOUR GITHUB REPO (CHANGE ONCE) ====================
-GITHUB_REPO = "YOURUSERNAME/YOURREPO"   # ←←← PUT YOUR ACTUAL USERNAME/REPO HERE
+# ==================== YOUR GITHUB REPO ====================
+GITHUB_REPO = "xanderosully-png/ERM"
 
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
@@ -121,7 +121,8 @@ def load_erm_data():
                 raw_url = file["download_url"]
                 df = pd.read_csv(raw_url)
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df = df.sort_values('timestamp')
+                df = df.sort_values('timestamp').drop_duplicates(subset='timestamp')
+                # Parse city name from filename: erm_v4.4_columbus_oh_20260331.csv
                 stem = file["name"].replace(".csv", "")
                 parts = stem.split("_")
                 city_key = "_".join(parts[2:-1]) if len(parts) > 3 else parts[2]
@@ -239,20 +240,22 @@ else:
             df = erm_data[selected_saved_city]
             st.subheader(f"📊 Saved Historical Data — {selected_saved_city.replace('_', ' ')}")
             st.caption(f"Total records: {len(df):,} | Range: {df['timestamp'].min().date()} – {df['timestamp'].max().date()}")
-            
+
+            # Main chart: Actual vs ERM Predictions (all horizons)
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df["timestamp"], y=df["live_temp"], name="Actual Temp", line=dict(color="#1f77b4", width=3)))
             for col in [c for c in df.columns if c.startswith("next_predicted_")]:
                 hours = col.split("_")[-1].replace("h", "")
                 fig.add_trace(go.Scatter(x=df["timestamp"], y=df[col], name=f"{hours}h ERM Pred", line=dict(dash="dash")))
-            fig.update_layout(title="Temperature + ERM Predictions", height=500, xaxis_title="Time", yaxis_title="°C")
+            fig.update_layout(title="Temperature + ERM Predictions (using full ERM formula)", height=500, xaxis_title="Time", yaxis_title="°C")
             st.plotly_chart(fig, use_container_width=True)
-            
+
+            # Improvement chart
             fig_imp = go.Figure()
             fig_imp.add_trace(go.Scatter(x=df["timestamp"], y=df["improvement_pct"], name="% Improvement", line=dict(color="#2ca02c")))
             fig_imp.update_layout(title="ERM Improvement over Baseline", height=300, xaxis_title="Time", yaxis_title="%")
             st.plotly_chart(fig_imp, use_container_width=True)
-            
+
             st.dataframe(df, use_container_width=True)
 
 with st.expander("📥 Downloads & Log"):
