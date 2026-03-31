@@ -138,73 +138,76 @@ def git_backup(data_dir: Path):
 
 @app.get("/update")
 async def update_data():
-    base_dir = Path(__file__).parent
-    data_dir = base_dir / "ERM_Data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        base_dir = Path(__file__).parent
+        data_dir = base_dir / "ERM_Data"
+        data_dir.mkdir(parents=True, exist_ok=True)
 
-    cities = DEFAULT_CITIES
-    erms = {city['name']: ERM_Live_Adaptive() for city in cities}
-    previous_data = {city['name']: None for city in cities}
+        cities = DEFAULT_CITIES
+        erms = {city['name']: ERM_Live_Adaptive() for city in cities}
+        previous_data = {city['name']: None for city in cities}
 
-    now = datetime.now()
-    today_str = now.strftime('%Y%m%d')
+        now = datetime.now()
+        today_str = now.strftime('%Y%m%d')
 
-    for city in cities:
-        data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
-        if not data:
-            continue
+        for city in cities:
+            data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
+            if not data:
+                continue
 
-        live_temp = data['temp']
-        hour_of_day = now.hour
-        erm = erms[city['name']]
-        prev = previous_data[city['name']]
+            live_temp = data['temp']
+            hour_of_day = now.hour
+            erm = erms[city['name']]
+            prev = previous_data[city['name']]
 
-        if prev is not None:
-            erm_err = abs(live_temp - prev['next_predicted'])
-            baseline_err = abs(live_temp - prev['live_temp'])
-            improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01)
-        else:
-            improvement = 0.0
+            if prev is not None:
+                erm_err = abs(live_temp - prev['next_predicted'])
+                baseline_err = abs(live_temp - prev['live_temp'])
+                improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01)
+            else:
+                improvement = 0.0
 
-        Er_flux, next_predicted, beta = erm.step(
-            live_temp, data['humidity'], data['wind'], data['pressure'],
-            prev['live_temp'] if prev else None,
-            hour_of_day, city['local_avg_temp'], city['local_temp_range']
-        )
+            Er_flux, next_predicted, beta = erm.step(
+                live_temp, data['humidity'], data['wind'], data['pressure'],
+                prev['live_temp'] if prev else None,
+                hour_of_day, city['local_avg_temp'], city['local_temp_range']
+            )
 
-        future = erm.predict_future([1, 3, 6, 12, 24, 48])
+            future = erm.predict_future([1, 3, 6, 12, 24, 48])
 
-        row = {
-            'timestamp': data['time'],
-            'live_temp': live_temp,
-            'humidity': data['humidity'],
-            'wind': data['wind'],
-            'pressure': data['pressure'],
-            'erm_flux': Er_flux,
-            'beta': beta,
-            'next_predicted_1h': next_predicted + (future[1] * beta),
-            'next_predicted_3h': next_predicted + (future[3] * beta),
-            'next_predicted_6h': next_predicted + (future[6] * beta),
-            'next_predicted_12h': next_predicted + (future[12] * beta),
-            'next_predicted_24h': next_predicted + (future[24] * beta),
-            'next_predicted_48h': next_predicted + (future[48] * beta),
-            'tomorrow_max': data.get('tomorrow_max'),
-            'tomorrow_min': data.get('tomorrow_min'),
-            'improvement_pct': improvement
-        }
+            row = {
+                'timestamp': data['time'],
+                'live_temp': live_temp,
+                'humidity': data['humidity'],
+                'wind': data['wind'],
+                'pressure': data['pressure'],
+                'erm_flux': Er_flux,
+                'beta': beta,
+                'next_predicted_1h': next_predicted + (future[1] * beta),
+                'next_predicted_3h': next_predicted + (future[3] * beta),
+                'next_predicted_6h': next_predicted + (future[6] * beta),
+                'next_predicted_12h': next_predicted + (future[12] * beta),
+                'next_predicted_24h': next_predicted + (future[24] * beta),
+                'next_predicted_48h': next_predicted + (future[48] * beta),
+                'tomorrow_max': data.get('tomorrow_max'),
+                'tomorrow_min': data.get('tomorrow_min'),
+                'improvement_pct': improvement
+            }
 
-        csv_path = data_dir / f"erm_v{VERSION}_{city['name'].lower().replace(' ', '_')}_{today_str}.csv"
-        file_exists = csv_path.exists()
-        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=row.keys())
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(row)
+            csv_path = data_dir / f"erm_v{VERSION}_{city['name'].lower().replace(' ', '_')}_{today_str}.csv"
+            file_exists = csv_path.exists()
+            with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=row.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
 
-        previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
+            previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
 
-    git_backup(data_dir)
-    return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
+        git_backup(data_dir)
+        return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.get("/health")
 async def health():
