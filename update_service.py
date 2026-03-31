@@ -122,12 +122,19 @@ def git_backup(data_dir: Path):
         return
     try:
         repo_root = data_dir.parent
+        # Initialize git if needed
         if not (repo_root / ".git").exists():
             subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
             print("✅ Git repo initialized")
+        # Add or update origin remote
+        remotes = subprocess.run(["git", "remote"], cwd=repo_root, capture_output=True, text=True).stdout
         remote_url = f"https://{token}@github.com/{repo}.git"
-        subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-        print("✅ Remote URL updated")
+        if "origin" not in remotes:
+            subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+            print("✅ Remote origin added")
+        else:
+            subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+            print("✅ Remote URL updated")
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
         print("✅ Git config set")
