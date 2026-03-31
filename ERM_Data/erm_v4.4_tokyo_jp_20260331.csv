@@ -1,3 +1,4 @@
 timestamp,live_temp,humidity,wind,pressure,erm_flux,beta,next_predicted_1h,next_predicted_3h,next_predicted_6h,next_predicted_12h,next_predicted_24h,next_predicted_48h,tomorrow_max,tomorrow_min,improvement_pct
 2026-03-31T19:11:14.679088,12.8,99,4.8,1003.1,0.0,0.01,12.8,12.8,12.8,12.8,12.8,12.8,14.2,8.2,0.0
 2026-03-31T19:15:03.113861,12.8,97,5.0,1003.4,0.0,0.01,12.8,12.8,12.8,12.8,12.8,12.8,14.2,8.2,0.0
+2026-03-31T19:27:15.988673,12.8,97,5.0,1003.4,0.0,0.01,12.8,12.8,12.8,12.8,12.8,12.8,14.2,8.2,0.0
