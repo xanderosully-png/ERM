@@ -11,6 +11,9 @@ import zipfile
 
 VERSION = "4.4"
 
+# ==================== YOUR REPO (CHANGE THIS ONCE) ====================
+GITHUB_REPO = "xanderosully/ERM"   # ←←← PUT YOUR ACTUAL GITHUB USERNAME/REPO HERE
+
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
     {"name": "Miami_FL",    "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
@@ -80,9 +83,15 @@ class ERM_Live_Adaptive:
         return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in steps_list}
 
 def fetch_data(lat, lon, tz):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure&daily=temperature_2m_max,temperature_2m_min&timezone={tz.replace('/', '%2F')}"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": tz
+    }
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         current = data["current"]
@@ -100,8 +109,8 @@ def fetch_data(lat, lon, tz):
         return None
 
 @st.cache_data(ttl=300)
-def load_erm_data(github_repo: str):
-    data_dir_url = f"https://api.github.com/repos/{github_repo}/contents/ERM_Data"
+def load_erm_data():
+    data_dir_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ERM_Data"
     try:
         resp = requests.get(data_dir_url)
         resp.raise_for_status()
@@ -130,8 +139,6 @@ st.title("🌍 ERM v4.4 — Live Adaptive Weather Predictor + Saved ERM_Data")
 
 with st.sidebar:
     st.header("Controls")
-    github_repo = st.text_input("GitHub Repo (username/repo)", value="YOURUSERNAME/YOURREPO", help="Enter your exact GitHub repo so Saved mode can load ERM_Data")
-    
     available = [c["name"] for c in DEFAULT_CITIES]
     selected = st.multiselect("Cities (Live mode)", available, default=["Columbus_OH"])
 
@@ -147,7 +154,7 @@ with st.sidebar:
 def to_unit(temp_c, unit):
     return round(temp_c * 9/5 + 32, 1) if unit == "°F" else round(temp_c, 1)
 
-if "erms_live" not in st.session_state:
+if "erms_live" not in st.session_state or set(st.session_state.get("erms_live", {}).keys()) != set(selected):
     st.session_state.erms_live = {name: ERM_Live_Adaptive() for name in selected}
     st.session_state.previous_live = {name: None for name in selected}
     st.session_state.history_live = {name: [] for name in selected}
@@ -213,9 +220,9 @@ if mode == "Live":
                 st.error(f"❌ {name} — API unavailable")
 
 else:
-    erm_data = load_erm_data(github_repo)
+    erm_data = load_erm_data()
     if not erm_data:
-        st.info("📁 No ERM_Data files found yet.\n\nThe background worker is collecting live data and will create CSVs in your GitHub repo shortly.")
+        st.info("📁 No ERM_Data files found yet.\n\nThe background worker is collecting live data and will create CSVs shortly.")
     else:
         st.success(f"✅ Loaded {len(erm_data)} cities from GitHub ERM_Data/")
         selected_saved_city = st.selectbox("Select city to view saved data", options=list(erm_data.keys()))
@@ -259,4 +266,4 @@ if mode == "Live" and auto_refresh:
         st.session_state.force_update = False
         st.rerun()
 
-st.caption("🚀 ERM v4.4 • Live + GitHub-backed ERM_Data mode")
+st.caption("🚀 ERM v4.4 • Live + Auto-loaded GitHub ERM_Data")
