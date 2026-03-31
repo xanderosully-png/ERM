@@ -1,1 +1,15 @@
+name: ERM Live Update
 
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:         # allows manual trigger
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping ERM update endpoint
+        run: |
+          curl -f -X GET "https://ermforecast.onrender.com/update" || echo "Ping failed (normal on first wake-up)"
