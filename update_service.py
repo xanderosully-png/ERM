@@ -87,7 +87,7 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
         "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": timezone
     }
-    for attempt in range(3):
+    for attempt in range(2):  # only 2 attempts
         try:
             resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
             resp.raise_for_status()
@@ -105,10 +105,10 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
             }
         except Exception as e:
             if "429" in str(e):
-                print(f"⏳ Rate limit hit for {lat},{lon} – waiting longer")
-                time.sleep(5)
-            if attempt < 2:
-                time.sleep(2 ** attempt)
+                print(f"⏳ Rate limit hit – waiting 10 seconds")
+                time.sleep(10)
+            if attempt < 1:
+                time.sleep(3)
     return None
 
 def git_backup(data_dir: Path):
@@ -125,22 +125,14 @@ def git_backup(data_dir: Path):
         if not (repo_root / ".git").exists():
             subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
             print("✅ Git repo initialized")
-        # Ensure origin remote exists
-        remotes = subprocess.run(["git", "remote"], cwd=repo_root, capture_output=True, text=True).stdout
-        if "origin" not in remotes:
-            remote_url = f"https://{token}@github.com/{repo}.git"
-            subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Remote origin added")
-        else:
-            remote_url = f"https://{token}@github.com/{repo}.git"
-            subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Remote URL updated")
+        remote_url = f"https://{token}@github.com/{repo}.git"
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+        print("✅ Remote URL updated")
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
         print("✅ Git config set")
         subprocess.run(["git", "add", str(data_dir)], cwd=repo_root, check=True, capture_output=True)
         print("✅ Git add completed")
-        # Ensure we are on main branch
         subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
         print("✅ Switched to main branch")
         commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], cwd=repo_root, capture_output=True, text=True)
@@ -225,7 +217,7 @@ async def update_data():
         print(f"✅ CSV written for {city['name']} → {csv_path} ({csv_path.stat().st_size} bytes)")
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
-        time.sleep(3)  # ← Rate-limit safety
+        time.sleep(3)  # rate-limit safety
 
     print("✅ All cities processed. Starting git backup...")
     git_backup(data_dir)
