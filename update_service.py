@@ -118,6 +118,10 @@ def git_backup(data_dir: Path):
         print("ERROR: GITHUB_TOKEN or GITHUB_REPO is missing!")
         return
     try:
+        # Initialize git if no .git folder exists
+        if not (data_dir.parent / ".git").exists():
+            subprocess.run(["git", "init"], cwd=data_dir.parent, check=True, capture_output=True)
+            print("✅ Git repo initialized")
         remote_url = f"https://{token}@github.com/{repo}.git"
         subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True, capture_output=True)
         print("✅ Remote URL set with token")
@@ -129,7 +133,7 @@ def git_backup(data_dir: Path):
         commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], capture_output=True, text=True)
         print(f"Commit result: {commit_result.returncode} - {commit_result.stdout.strip() or commit_result.stderr.strip()}")
         if commit_result.returncode == 0:
-            push_result = subprocess.run(["git", "push"], capture_output=True, text=True)
+            push_result = subprocess.run(["git", "push", "-u", "origin", "main", "--force"], capture_output=True, text=True)
             print(f"Push result: {push_result.returncode} - {push_result.stdout.strip() or push_result.stderr.strip()}")
             print("✅ GitHub backup successful")
         else:
@@ -154,7 +158,7 @@ async def update_data():
     for city in cities:
         data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
         if not data:
-            print(f"⚠️  Failed to fetch data for {city['name']}")
+            print(f"⚠️ Failed to fetch data for {city['name']}")
             continue
 
         live_temp = data['temp']
@@ -177,7 +181,24 @@ async def update_data():
 
         future = erm.predict_future([1, 3, 6, 12, 24, 48])
 
-        row = { ... }  # (same row dict as before - omitted for brevity)
+        row = {
+            'timestamp': data['time'],
+            'live_temp': live_temp,
+            'humidity': data['humidity'],
+            'wind': data['wind'],
+            'pressure': data['pressure'],
+            'erm_flux': Er_flux,
+            'beta': beta,
+            'next_predicted_1h': next_predicted + (future[1] * beta),
+            'next_predicted_3h': next_predicted + (future[3] * beta),
+            'next_predicted_6h': next_predicted + (future[6] * beta),
+            'next_predicted_12h': next_predicted + (future[12] * beta),
+            'next_predicted_24h': next_predicted + (future[24] * beta),
+            'next_predicted_48h': next_predicted + (future[48] * beta),
+            'tomorrow_max': data.get('tomorrow_max'),
+            'tomorrow_min': data.get('tomorrow_min'),
+            'improvement_pct': improvement
+        }
 
         csv_path = data_dir / f"erm_v{VERSION}_{city['name'].lower().replace(' ', '_')}_{today_str}.csv"
         file_exists = csv_path.exists()
@@ -191,7 +212,7 @@ async def update_data():
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
 
-    print(f"✅ All {len(cities)} cities processed. Starting git backup...")
+    print(f"✅ All cities processed. Starting git backup...")
     git_backup(data_dir)
     return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
 
