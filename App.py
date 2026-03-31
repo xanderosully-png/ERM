@@ -80,19 +80,26 @@ class ERM_Live_Adaptive:
         return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in [1, 3, 6, 12, 24]}
 
 def fetch_data(lat, lon, tz):
-    url = f"https://api.open-meteo.com/v1/current?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure&timezone={tz.replace('/', '%2F')}"
+    """Fixed: uses the correct /v1/forecast endpoint + proper param encoding"""
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
+        "timezone": tz
+    }
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
         resp.raise_for_status()
-        data = resp.json()['current']
+        data = resp.json()["current"]
         return {
-            'temp': data['temperature_2m'],
-            'humidity': data['relative_humidity_2m'],
-            'wind': data['wind_speed_10m'],
-            'pressure': data['surface_pressure'],
-            'time': datetime.now().isoformat()
+            "temp": data["temperature_2m"],
+            "humidity": data["relative_humidity_2m"],
+            "wind": data["wind_speed_10m"],
+            "pressure": data["surface_pressure"],
+            "time": datetime.now().isoformat()
         }
-    except Exception:
+    except Exception as e:
+        st.error(f"API error for {lat},{lon}: {type(e).__name__} - {e}")  # ← shows exact error next time
         return None
 
 # ====================== STREAMLIT APP ======================
