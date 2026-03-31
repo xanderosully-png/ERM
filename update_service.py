@@ -5,7 +5,6 @@ import subprocess
 import numpy as np
 import requests
 import csv
-import logging
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -16,18 +15,12 @@ app = FastAPI(title="ERM Live Update Service")
 VERSION = "4.4"
 
 DEFAULT_CITIES = [
-    {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York",
-     "local_avg_temp": 11.5, "local_temp_range": 35.0},
-    {"name": "Miami_FL",    "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York",
-     "local_avg_temp": 25.0, "local_temp_range": 15.0},
-    {"name": "New_York_NY", "lat": 40.7128, "lon": -74.0060, "tz": "America/New_York",
-     "local_avg_temp": 12.0, "local_temp_range": 32.0},
-    {"name": "Los_Angeles_CA", "lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles",
-     "local_avg_temp": 18.0, "local_temp_range": 20.0},
-    {"name": "London_UK",   "lat": 51.5074, "lon": -0.1278, "tz": "Europe/London",
-     "local_avg_temp": 11.0, "local_temp_range": 25.0},
-    {"name": "Tokyo_JP",    "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo",
-     "local_avg_temp": 16.0, "local_temp_range": 28.0},
+    {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
+    {"name": "Miami_FL",    "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
+    {"name": "New_York_NY", "lat": 40.7128, "lon": -74.0060, "tz": "America/New_York", "local_avg_temp": 12.0, "local_temp_range": 32.0},
+    {"name": "Los_Angeles_CA", "lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles", "local_avg_temp": 18.0, "local_temp_range": 20.0},
+    {"name": "London_UK",   "lat": 51.5074, "lon": -0.1278, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
+    {"name": "Tokyo_JP",    "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 28.0},
 ]
 
 def load_cities(base_dir: Path) -> List[Dict]:
@@ -135,8 +128,7 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
                 'tomorrow_max': daily['temperature_2m_max'][1],
                 'tomorrow_min': daily['temperature_2m_min'][1]
             }
-        except Exception as e:
-            logging.warning(f"Fetch failed (attempt {attempt+1}): {e}")
+        except Exception:
             if attempt < 2:
                 time.sleep(2 ** attempt)
     return None
@@ -148,9 +140,8 @@ def git_backup(data_dir: Path):
         subprocess.run(["git", "add", str(data_dir)], check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], check=True, capture_output=True)
         subprocess.run(["git", "push"], check=True, capture_output=True)
-        logging.info("✅ GitHub backup successful")
-    except Exception as e:
-        logging.warning(f"Git backup failed (non-fatal): {e}")
+    except Exception:
+        pass  # silent fail
 
 @app.get("/update")
 async def update_data():
@@ -164,8 +155,6 @@ async def update_data():
 
     now = datetime.now()
     today_str = now.strftime('%Y%m%d')
-
-    logging.info(f"=== LIVE UPDATE at {now.strftime('%Y-%m-%d %H:%M:%S')} ===")
 
     for city in cities:
         data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
@@ -223,11 +212,11 @@ async def update_data():
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
 
     git_backup(data_dir)
-    return {"status": "success", "message": f"Updated {len(cities)} cities at {datetime.now()}"}
+    return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "time": datetime.now().isoformat()}
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
