@@ -100,10 +100,11 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
                 'wind': current['wind_speed_10m'],
                 'pressure': current['surface_pressure'],
                 'time': datetime.now().isoformat(),
-                'tomorrow_max': daily['temperature_2m_max'][1],
-                'tomorrow_min': daily['temperature_2m_min'][1]
+                'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
+                'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None
             }
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ API fetch attempt {attempt+1} failed for lat/lon {lat},{lon}: {e}")
             if attempt < 2:
                 time.sleep(2 ** attempt)
     return None
@@ -118,22 +119,29 @@ def git_backup(data_dir: Path):
         print("ERROR: GITHUB_TOKEN or GITHUB_REPO is missing!")
         return
     try:
-        # Force initialize git repo
-        if not (data_dir.parent / ".git").exists():
-            subprocess.run(["git", "init"], cwd=data_dir.parent, check=True, capture_output=True)
+        repo_root = data_dir.parent
+        if not (repo_root / ".git").exists():
+            subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
             print("✅ Git repo initialized")
-        remote_url = f"https://{token}@github.com/{repo}.git"
-        subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True, capture_output=True)
-        print("✅ Remote URL set with token")
+        # Check if origin remote exists
+        remote_check = subprocess.run(["git", "remote"], cwd=repo_root, capture_output=True, text=True)
+        if "origin" not in remote_check.stdout:
+            remote_url = f"https://{token}@github.com/{repo}.git"
+            subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+            print("✅ Remote origin added")
+        else:
+            remote_url = f"https://{token}@github.com/{repo}.git"
+            subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+            print("✅ Remote URL updated")
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
         print("✅ Git config set")
-        subprocess.run(["git", "add", str(data_dir)], check=True, capture_output=True)
+        subprocess.run(["git", "add", str(data_dir)], cwd=repo_root, check=True, capture_output=True)
         print("✅ Git add completed")
-        commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], capture_output=True, text=True)
+        commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], cwd=repo_root, capture_output=True, text=True)
         print(f"Commit result: {commit_result.returncode} - {commit_result.stdout.strip() or commit_result.stderr.strip()}")
         if commit_result.returncode == 0:
-            push_result = subprocess.run(["git", "push", "-u", "origin", "main", "--force"], capture_output=True, text=True)
+            push_result = subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=repo_root, capture_output=True, text=True)
             print(f"Push result: {push_result.returncode} - {push_result.stdout.strip() or push_result.stderr.strip()}")
             print("✅ GitHub backup SUCCESSFUL")
         else:
