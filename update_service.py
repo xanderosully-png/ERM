@@ -108,24 +108,33 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
     return None
 
 def git_backup(data_dir: Path):
+    print("=== GIT BACKUP STARTED ===")
     token = os.getenv("GITHUB_TOKEN")
+    repo = os.getenv("GITHUB_REPO", GITHUB_REPO)
+    print(f"GITHUB_TOKEN present: {'YES' if token else 'NO'}")
+    print(f"Using repo: {repo}")
     if not token:
-        print("ERROR: GITHUB_TOKEN environment variable is not set!")
+        print("ERROR: GITHUB_TOKEN is missing!")
         return
     try:
-        repo_url = f"https://{token}@github.com/{os.getenv('GITHUB_REPO', 'YOURUSERNAME/YOURREPO')}.git"
-        subprocess.run(["git", "remote", "set-url", "origin", repo_url], check=True, capture_output=True)
+        remote_url = f"https://{token}@github.com/{repo}.git"
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True, capture_output=True)
+        print("Remote URL set with token")
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
+        print("Git config set")
         subprocess.run(["git", "add", str(data_dir)], check=True, capture_output=True)
+        print("Git add completed")
         commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], capture_output=True, text=True)
+        print(f"Commit result: {commit_result.returncode} - {commit_result.stdout.strip() or commit_result.stderr.strip()}")
         if commit_result.returncode == 0:
             push_result = subprocess.run(["git", "push"], capture_output=True, text=True)
+            print(f"Push result: {push_result.returncode} - {push_result.stdout.strip() or push_result.stderr.strip()}")
             print("✅ GitHub backup successful")
         else:
-            print("No changes to commit")
+            print("No new data to commit")
     except Exception as e:
-        print(f"Git backup error: {e}")
+        print(f"Git backup FAILED: {e}")
 
 @app.get("/update")
 async def update_data():
