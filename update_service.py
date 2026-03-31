@@ -103,57 +103,34 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
                 'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
                 'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None
             }
-        except Exception as e:
-            if "429" in str(e):
-                print(f"⏳ Rate limit hit – waiting 10 seconds")
-                time.sleep(10)
+        except Exception:
             if attempt < 1:
                 time.sleep(3)
     return None
 
 def git_backup(data_dir: Path):
-    print("=== GIT BACKUP STARTED ===")
     token = os.getenv("GITHUB_TOKEN")
     repo = os.getenv("GITHUB_REPO")
-    print(f"GITHUB_TOKEN present: {'YES' if token else 'NO'}")
-    print(f"GITHUB_REPO: {repo}")
     if not token or not repo:
-        print("ERROR: GITHUB_TOKEN or GITHUB_REPO is missing!")
         return
     try:
         repo_root = data_dir.parent
-        # Initialize git if needed
         if not (repo_root / ".git").exists():
             subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Git repo initialized")
-        # Add or update origin remote
-        remotes = subprocess.run(["git", "remote"], cwd=repo_root, capture_output=True, text=True).stdout
         remote_url = f"https://{token}@github.com/{repo}.git"
-        if "origin" not in remotes:
-            subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Remote origin added")
-        else:
-            subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Remote URL updated")
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
-        print("✅ Git config set")
         subprocess.run(["git", "add", str(data_dir)], cwd=repo_root, check=True, capture_output=True)
-        print("✅ Git add completed")
         subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
-        print("✅ Switched to main branch")
         commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], cwd=repo_root, capture_output=True, text=True)
-        print(f"Commit result: {commit_result.returncode} - {commit_result.stdout.strip() or commit_result.stderr.strip()}")
         if commit_result.returncode == 0:
-            push_result = subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=repo_root, capture_output=True, text=True)
-            print(f"Push result: {push_result.returncode} - {push_result.stdout.strip() or push_result.stderr.strip()}")
-            print("✅ GitHub backup SUCCESSFUL")
-        else:
-            print("No changes to commit (normal)")
-    except Exception as e:
-        print(f"Git backup FAILED: {e}")
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=repo_root, capture_output=True, text=True)
+    except Exception:
+        pass
 
 @app.get("/update")
+@app.head("/update")
 async def update_data():
     base_dir = Path(__file__).parent
     data_dir = base_dir / "ERM_Data"
@@ -170,7 +147,6 @@ async def update_data():
     for city in cities:
         data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
         if not data:
-            print(f"⚠️ Failed to fetch data for {city['name']}")
             time.sleep(10)
             continue
 
@@ -215,13 +191,14 @@ async def update_data():
 
         csv_path = data_dir / f"erm_v{VERSION}_{city['name'].lower().replace(' ', '_')}_{today_str}.csv"
         file_exists = csv_path.exists()
-        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+
+        with open(csv_path, 'a', newline='', encoding='utf-8') as f:   # ← 'a' = append, never overwrite
             writer = csv.DictWriter(f, fieldnames=row.keys())
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
 
-        print(f"✅ CSV written for {city['name']} → {csv_path} ({csv_path.stat().st_size} bytes)")
+        print(f"✅ Appended row to {city['name']} → {csv_path} (now {csv_path.stat().st_size} bytes)")
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
         time.sleep(10)
