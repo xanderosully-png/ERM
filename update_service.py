@@ -5,7 +5,6 @@ import subprocess
 import numpy as np
 import requests
 import csv
-import time                     # ← This line fixes the error
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -113,9 +112,12 @@ def git_backup(data_dir: Path):
     token = os.getenv("GITHUB_TOKEN")
     repo = os.getenv("GITHUB_REPO")
     print(f"GITHUB_TOKEN present: {'YES' if token else 'NO'}")
-    print(f"GITHUB_REPO: {repo}")
-    if not token or not repo:
-        print("ERROR: GITHUB_TOKEN or GITHUB_REPO is missing!")
+    print(f"GITHUB_REPO used: {repo}")
+    if not token:
+        print("ERROR: GITHUB_TOKEN environment variable is missing in Render!")
+        return
+    if not repo:
+        print("ERROR: GITHUB_REPO environment variable is missing!")
         return
     try:
         remote_url = f"https://{token}@github.com/{repo}.git"
@@ -133,7 +135,7 @@ def git_backup(data_dir: Path):
             print(f"Push result: {push_result.returncode} - {push_result.stdout.strip() or push_result.stderr.strip()}")
             print("✅ GitHub backup successful")
         else:
-            print("No changes to commit (normal)")
+            print("No changes to commit (normal if no new data)")
     except Exception as e:
         print(f"Git backup FAILED: {e}")
 
