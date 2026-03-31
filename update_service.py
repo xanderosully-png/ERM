@@ -110,16 +110,16 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
 def git_backup(data_dir: Path):
     print("=== GIT BACKUP STARTED ===")
     token = os.getenv("GITHUB_TOKEN")
-    repo = os.getenv("GITHUB_REPO", GITHUB_REPO)
+    repo = os.getenv("GITHUB_REPO")
     print(f"GITHUB_TOKEN present: {'YES' if token else 'NO'}")
-    print(f"Using repo: {repo}")
-    if not token:
-        print("ERROR: GITHUB_TOKEN is missing!")
+    print(f"GITHUB_REPO: {repo}")
+    if not token or not repo:
+        print("ERROR: GITHUB_TOKEN or GITHUB_REPO is missing!")
         return
     try:
         remote_url = f"https://{token}@github.com/{repo}.git"
         subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=True, capture_output=True)
-        print("Remote URL set with token")
+        print("Remote URL set")
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
         print("Git config set")
@@ -132,7 +132,7 @@ def git_backup(data_dir: Path):
             print(f"Push result: {push_result.returncode} - {push_result.stdout.strip() or push_result.stderr.strip()}")
             print("✅ GitHub backup successful")
         else:
-            print("No new data to commit")
+            print("No changes to commit (normal)")
     except Exception as e:
         print(f"Git backup FAILED: {e}")
 
