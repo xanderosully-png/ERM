@@ -2,11 +2,10 @@ import streamlit as st
 import numpy as np
 import requests
 import time
-import json
-from datetime import datetime
-from collections import deque
 import pandas as pd
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
+from collections import deque
 from io import StringIO, BytesIO
 import zipfile
 
@@ -70,54 +69,56 @@ class ERM_Live_Adaptive:
         next_predicted = current_temp + (Er_new * beta)
         return Er_new, next_predicted, beta
 
-    def predict_future(self):
+    def predict_future(self, steps_list=[1, 3, 6, 12, 24, 48]):
         if len(self.Er_history) < 3:
             last = float(self.Er_history[-1]) if self.Er_history else 0.0
-            return {s: last for s in [1, 3, 6, 12, 24]}
+            return {s: last for s in steps_list}
         x = np.arange(len(self.Er_history), dtype=np.float32)
         y = np.array(self.Er_history, dtype=np.float32)
         slope, intercept = np.polyfit(x, y, 1)
-        return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in [1, 3, 6, 12, 24]}
+        return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in steps_list}
 
 def fetch_data(lat, lon, tz):
-    """Fixed: uses the correct /v1/forecast endpoint + proper param encoding"""
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
-        "timezone": tz
-    }
+    # Current + daily forecast for tomorrow
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure&daily=temperature_2m_max,temperature_2m_min&timezone={tz.replace('/', '%2F')}"
     try:
-        resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
+        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        data = resp.json()["current"]
+        data = resp.json()
+        current = data["current"]
+        daily = data["daily"]
+        tomorrow_max = daily["temperature_2m_max"][1]   # index 1 = tomorrow
+        tomorrow_min = daily["temperature_2m_min"][1]
         return {
-            "temp": data["temperature_2m"],
-            "humidity": data["relative_humidity_2m"],
-            "wind": data["wind_speed_10m"],
-            "pressure": data["surface_pressure"],
-            "time": datetime.now().isoformat()
+            'temp': current['temperature_2m'],
+            'humidity': current['relative_humidity_2m'],
+            'wind': current['wind_speed_10m'],
+            'pressure': current['surface_pressure'],
+            'time': datetime.now().isoformat(),
+            'tomorrow_max': tomorrow_max,
+            'tomorrow_min': tomorrow_min
         }
-    except Exception as e:
-        st.error(f"API error for {lat},{lon}: {type(e).__name__} - {e}")  # ← shows exact error next time
+    except Exception:
         return None
 
-# ====================== STREAMLIT APP ======================
+# ====================== STREAMLIT UI ======================
 st.set_page_config(page_title=f"ERM v{VERSION} Live", page_icon="🌡️", layout="wide")
-st.title("🌍 ERM v4.4 — Live Adaptive Weather Predictor")
+st.title("🌍 ERM v4.4 — Live Adaptive Weather Predictor + Next-Day Forecast")
 
-# Sidebar
 with st.sidebar:
     st.header("Controls")
     available = [c["name"] for c in DEFAULT_CITIES]
-    selected = st.multiselect("Cities", available, default=available[:3])
+    selected = st.multiselect("Cities", available, default=["Columbus_OH"])
+    unit = st.radio("Temperature unit", ["°F", "°C"], index=0, horizontal=True)
     interval_min = st.slider("Update every (minutes)", 1, 60, 5)
-    auto_refresh = st.toggle("Auto-refresh", True)
+    auto_refresh = st.toggle("Auto-refresh", value=True)
 
     if st.button("🔄 Update Now", type="primary", use_container_width=True):
         st.session_state.force_update = True
 
-# Init session state
+def to_unit(temp_c):
+    return round(temp_c * 9/5 + 32, 1) if unit == "°F" else round(temp_c, 1)
+
 if "erms" not in st.session_state:
     st.session_state.erms = {name: ERM_Live_Adaptive() for name in selected}
     st.session_state.previous = {name: None for name in selected}
@@ -125,7 +126,6 @@ if "erms" not in st.session_state:
 
 active_cities = [c for c in DEFAULT_CITIES if c["name"] in selected]
 
-# Main dashboard
 cols = st.columns(min(len(active_cities), 4))
 
 for idx, city in enumerate(active_cities):
@@ -133,41 +133,45 @@ for idx, city in enumerate(active_cities):
     data = fetch_data(city["lat"], city["lon"], city["tz"])
 
     if data:
-        live_temp = data["temp"]
+        live_temp_c = data["temp"]
         hour = datetime.now().hour
         erm = st.session_state.erms[name]
         prev = st.session_state.previous.get(name)
 
         if prev:
-            erm_err = abs(live_temp - prev["next_predicted"])
-            baseline_err = abs(live_temp - prev["live_temp"])
+            erm_err = abs(live_temp_c - prev["next_predicted"])
+            baseline_err = abs(live_temp_c - prev["live_temp"])
             improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01)
         else:
             improvement = 0.0
 
-        Er_flux, next_predicted, beta = erm.step(
-            live_temp, data["humidity"], data["wind"], data["pressure"],
+        Er_flux, next_predicted_c, beta = erm.step(
+            live_temp_c, data["humidity"], data["wind"], data["pressure"],
             prev["live_temp"] if prev else None, hour,
             city["local_avg_temp"], city["local_temp_range"]
         )
 
-        future = erm.predict_future()
-        st.session_state.history[name].append({
-            "time": datetime.now(), "live": live_temp,
-            "pred_1h": next_predicted + future[1] * beta,
-            "pred_3h": next_predicted + future[3] * beta
-        })
+        future = erm.predict_future([1, 3, 6, 12, 24, 48])  # added 48h for tomorrow
+        live_f = to_unit(live_temp_c)
+        pred_1h = to_unit(next_predicted_c + future[1] * beta)
+        pred_3h = to_unit(next_predicted_c + future[3] * beta)
+        pred_6h = to_unit(next_predicted_c + future[6] * beta)
+        pred_tomorrow = to_unit(next_predicted_c + future[48] * beta)  # next-day prediction
+
+        st.session_state.history[name].append({"time": datetime.now(), "live": live_f, "pred_1h": pred_1h})
         if len(st.session_state.history[name]) > 20:
             st.session_state.history[name] = st.session_state.history[name][-20:]
 
-        st.session_state.previous[name] = {"live_temp": live_temp, "next_predicted": next_predicted}
+        st.session_state.previous[name] = {"live_temp": live_temp_c, "next_predicted": next_predicted_c}
 
         with cols[idx % len(cols)]:
             st.subheader(f"📍 {name.replace('_', ' ')}")
-            st.metric("Current", f"{live_temp:.1f}°C", f"β={beta:.3f}")
-            st.metric("Next 1h", f"{next_predicted + future[1]*beta:.1f}°C", f"Imp: {improvement:.1f}%")
-            st.metric("Next 3h", f"{next_predicted + future[3]*beta:.1f}°C")
-            st.metric("Next 6h", f"{next_predicted + future[6]*beta:.1f}°C")
+            st.metric("Current", f"{live_f}°{unit[-1]}", f"β={beta:.3f}")
+            st.metric("Next 1h", f"{pred_1h}°{unit[-1]}", f"Imp: {improvement:.1f}%")
+            st.metric("Next 3h", f"{pred_3h}°{unit[-1]}")
+            st.metric("Next 6h", f"{pred_6h}°{unit[-1]}")
+            st.metric("🌅 Tomorrow (ERM)", f"{pred_tomorrow}°{unit[-1]}")
+            st.caption(f"Open-Meteo daily: {to_unit(data['tomorrow_max'])}° / {to_unit(data['tomorrow_min'])}°")
 
             if st.session_state.history[name]:
                 df = pd.DataFrame(st.session_state.history[name])
@@ -176,11 +180,11 @@ for idx, city in enumerate(active_cities):
                 fig.add_trace(go.Scatter(x=df["time"], y=df["pred_1h"], name="1h Pred", line=dict(dash="dash")))
                 fig.update_layout(height=180, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
                 st.plotly_chart(fig, use_container_width=True, key=f"chart_{name}")
+
     else:
         with cols[idx % len(cols)]:
             st.error(f"❌ {name} — API unavailable")
 
-# Downloads & log
 with st.expander("📥 Downloads & Log"):
     st.caption(f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     if st.button("Download all data as ZIP"):
@@ -194,7 +198,6 @@ with st.expander("📥 Downloads & Log"):
                     zf.writestr(f"erm_{name.lower()}.csv", csv_buffer.getvalue())
         st.download_button("⬇️ Download ZIP", zip_buffer.getvalue(), "ERM_data.zip", "application/zip")
 
-# Auto-refresh
 if auto_refresh:
     if "last_update" not in st.session_state:
         st.session_state.last_update = time.time()
@@ -203,4 +206,4 @@ if auto_refresh:
         st.session_state.force_update = False
         st.rerun()
 
-st.caption("🚀 Your exact ERM v4.4 engine • Fully mobile-friendly")
+st.caption("🚀 ERM v4.4 with next-day predictions • Fully mobile-friendly")
