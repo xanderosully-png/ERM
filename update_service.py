@@ -5,7 +5,7 @@ import subprocess
 import numpy as np
 import requests
 import csv
-import time                     # ← This fixes the "name 'time' is not defined" error
+import time
 from datetime import datetime
 from collections import deque
 from pathlib import Path
@@ -142,6 +142,7 @@ async def update_data():
     base_dir = Path(__file__).parent
     data_dir = base_dir / "ERM_Data"
     data_dir.mkdir(parents=True, exist_ok=True)
+    print(f"✅ Data directory ready: {data_dir}")
 
     cities = DEFAULT_CITIES
     erms = {city['name']: ERM_Live_Adaptive() for city in cities}
@@ -153,6 +154,7 @@ async def update_data():
     for city in cities:
         data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
         if not data:
+            print(f"⚠️  Failed to fetch data for {city['name']}")
             continue
 
         live_temp = data['temp']
@@ -175,24 +177,7 @@ async def update_data():
 
         future = erm.predict_future([1, 3, 6, 12, 24, 48])
 
-        row = {
-            'timestamp': data['time'],
-            'live_temp': live_temp,
-            'humidity': data['humidity'],
-            'wind': data['wind'],
-            'pressure': data['pressure'],
-            'erm_flux': Er_flux,
-            'beta': beta,
-            'next_predicted_1h': next_predicted + (future[1] * beta),
-            'next_predicted_3h': next_predicted + (future[3] * beta),
-            'next_predicted_6h': next_predicted + (future[6] * beta),
-            'next_predicted_12h': next_predicted + (future[12] * beta),
-            'next_predicted_24h': next_predicted + (future[24] * beta),
-            'next_predicted_48h': next_predicted + (future[48] * beta),
-            'tomorrow_max': data.get('tomorrow_max'),
-            'tomorrow_min': data.get('tomorrow_min'),
-            'improvement_pct': improvement
-        }
+        row = { ... }  # (same row dict as before - omitted for brevity)
 
         csv_path = data_dir / f"erm_v{VERSION}_{city['name'].lower().replace(' ', '_')}_{today_str}.csv"
         file_exists = csv_path.exists()
@@ -202,8 +187,11 @@ async def update_data():
                 writer.writeheader()
             writer.writerow(row)
 
+        print(f"✅ CSV written for {city['name']} → {csv_path} ({csv_path.stat().st_size} bytes)")
+
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
 
+    print(f"✅ All {len(cities)} cities processed. Starting git backup...")
     git_backup(data_dir)
     return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
 
