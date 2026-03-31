@@ -217,7 +217,7 @@ async def update_data():
         print(f"✅ CSV written for {city['name']} → {csv_path} ({csv_path.stat().st_size} bytes)")
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
-        time.sleep(10)  # ← 10-second safety delay between cities
+        time.sleep(10)
 
     print("✅ All cities processed. Starting git backup...")
     git_backup(data_dir)
