@@ -103,10 +103,16 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
                 'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
                 'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None
             }
-        except Exception as e:
-            print(f"⚠️ API fetch attempt {attempt+1} failed for lat/lon {lat},{lon}: {e}")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                print(f"⏳ Rate limit hit for {lat},{lon} – waiting longer")
+                time.sleep(5)  # longer backoff on 429
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(1.5 ** attempt)
+        except Exception as e:
+            print(f"⚠️ API error for {lat},{lon}: {e}")
+            if attempt < 2:
+                time.sleep(1.5 ** attempt)
     return None
 
 def git_backup(data_dir: Path):
@@ -123,18 +129,11 @@ def git_backup(data_dir: Path):
         if not (repo_root / ".git").exists():
             subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
             print("✅ Git repo initialized")
-        # Check if origin remote exists
-        remote_check = subprocess.run(["git", "remote"], cwd=repo_root, capture_output=True, text=True)
-        if "origin" not in remote_check.stdout:
-            remote_url = f"https://{token}@github.com/{repo}.git"
-            subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Remote origin added")
-        else:
-            remote_url = f"https://{token}@github.com/{repo}.git"
-            subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            print("✅ Remote URL updated")
-        subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
-        subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
+        remote_url = f"https://{token}@github.com/{repo}.git"
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+        print("✅ Remote URL updated")
+        subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
         print("✅ Git config set")
         subprocess.run(["git", "add", str(data_dir)], cwd=repo_root, check=True, capture_output=True)
         print("✅ Git add completed")
@@ -167,6 +166,7 @@ async def update_data():
         data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
         if not data:
             print(f"⚠️ Failed to fetch data for {city['name']}")
+            time.sleep(1.5)  # rate-limit safety
             continue
 
         live_temp = data['temp']
@@ -219,6 +219,7 @@ async def update_data():
         print(f"✅ CSV written for {city['name']} → {csv_path} ({csv_path.stat().st_size} bytes)")
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
+        time.sleep(1.5)  # safety delay between cities
 
     print("✅ All cities processed. Starting git backup...")
     git_backup(data_dir)
