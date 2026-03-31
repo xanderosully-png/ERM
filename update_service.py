@@ -23,19 +23,8 @@ DEFAULT_CITIES = [
     {"name": "Tokyo_JP",    "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 28.0},
 ]
 
-def load_cities(base_dir: Path) -> List[Dict]:
-    for candidate in [base_dir / "cities.json", base_dir / "ERM_Data" / "cities.json"]:
-        if candidate.exists():
-            try:
-                with open(candidate, encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-    return [c.copy() for c in DEFAULT_CITIES]
-
 class ERM_Live_Adaptive:
-    def __init__(self, history_size: int = 10, gamma: float = 0.935,
-                 lambda_damp: float = 0.28, alpha: float = 0.75):
+    def __init__(self, history_size: int = 10, gamma: float = 0.935, lambda_damp: float = 0.28, alpha: float = 0.75):
         self.history_size = history_size
         self.history: deque[float] = deque(maxlen=history_size)
         self.humidity_history: deque[float] = deque(maxlen=history_size)
@@ -46,10 +35,7 @@ class ERM_Live_Adaptive:
         self.lambda_damp = lambda_damp
         self.alpha = alpha
 
-    def _derive_variables(self, current_temp: float, current_humidity: float,
-                          current_wind: float, current_pressure: float,
-                          previous_temp: Optional[float], hour_of_day: int,
-                          local_avg_temp: float, local_temp_range: float):
+    def _derive_variables(self, current_temp: float, current_humidity: float, current_wind: float, current_pressure: float, previous_temp: Optional[float], hour_of_day: int, local_avg_temp: float, local_temp_range: float):
         self.history.append(current_temp)
         self.humidity_history.append(current_humidity)
         self.wind_history.append(current_wind)
@@ -66,32 +52,20 @@ class ERM_Live_Adaptive:
         k = 0.8 + np.mean(np.abs(diffs)) / 5 + np.mean(self.wind_history) / 50
         rhoE = 1.0 + ((np.mean(recent_t) - local_avg_temp) / local_temp_range) + (np.mean(self.pressure_history) - 1013) / 1000
         tauE = 0.95 + (hour_of_day / 48)
-
         return Nr, Tr, dphi, k, rhoE, tauE
 
-    def step(self, current_temp: float, current_humidity: float, current_wind: float,
-             current_pressure: float, previous_temp: Optional[float], hour_of_day: int,
-             local_avg_temp: float, local_temp_range: float):
-        Nr, Tr, dphi, k, rhoE, tauE = self._derive_variables(
-            current_temp, current_humidity, current_wind, current_pressure,
-            previous_temp, hour_of_day, local_avg_temp, local_temp_range)
-
+    def step(self, current_temp: float, current_humidity: float, current_wind: float, current_pressure: float, previous_temp: Optional[float], hour_of_day: int, local_avg_temp: float, local_temp_range: float):
+        Nr, Tr, dphi, k, rhoE, tauE = self._derive_variables(current_temp, current_humidity, current_wind, current_pressure, previous_temp, hour_of_day, local_avg_temp, local_temp_range)
         base = (Nr * Tr * dphi) / max(k, 1e-8)
         f_field = base * (rhoE ** 0.5) * (tauE ** 0.5)
-
         recursive = 0.0
         if self.Er_history:
             times = np.arange(len(self.Er_history), 0, -1, dtype=np.float32)
             decayed = np.array(self.Er_history, dtype=np.float32) * (self.gamma ** times)
             recursive = np.sum(decayed) ** self.alpha
-
-        Er_new = f_field + (self.lambda_damp * recursive)
-        Er_new = np.clip(Er_new, -200, 200)
+        Er_new = np.clip(f_field + (self.lambda_damp * recursive), -200, 200)
         self.Er_history.append(Er_new)
-
-        beta_raw = np.std(self.history) / (np.std(self.Er_history) + 1e-6)
-        beta = np.clip(beta_raw, max(0.01, np.std(self.history)/50), max(1.0, np.std(self.history)/2))
-
+        beta = np.clip(np.std(self.history) / (np.std(self.Er_history) + 1e-6), max(0.01, np.std(self.history)/50), max(1.0, np.std(self.history)/2))
         next_predicted = current_temp + (Er_new * beta)
         return Er_new, next_predicted, beta
 
@@ -105,13 +79,7 @@ class ERM_Live_Adaptive:
         return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in steps_list}
 
 def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "timezone": timezone
-    }
+    params = {"latitude": lat, "longitude": lon, "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure", "daily": "temperature_2m_max,temperature_2m_min", "timezone": timezone}
     for attempt in range(3):
         try:
             resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
@@ -119,15 +87,7 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
             data = resp.json()
             current = data['current']
             daily = data['daily']
-            return {
-                'temp': current['temperature_2m'],
-                'humidity': current['relative_humidity_2m'],
-                'wind': current['wind_speed_10m'],
-                'pressure': current['surface_pressure'],
-                'time': datetime.now().isoformat(),
-                'tomorrow_max': daily['temperature_2m_max'][1],
-                'tomorrow_min': daily['temperature_2m_min'][1]
-            }
+            return {'temp': current['temperature_2m'], 'humidity': current['relative_humidity_2m'], 'wind': current['wind_speed_10m'], 'pressure': current['surface_pressure'], 'time': datetime.now().isoformat(), 'tomorrow_max': daily['temperature_2m_max'][1], 'tomorrow_min': daily['temperature_2m_min'][1]}
         except Exception:
             if attempt < 2:
                 time.sleep(2 ** attempt)
@@ -135,13 +95,11 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
 
 def git_backup(data_dir: Path):
     try:
-        subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], check=True, capture_output=True)
-        subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], check=True, capture_output=True)
         subprocess.run(["git", "add", str(data_dir)], check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], check=True, capture_output=True)
         subprocess.run(["git", "push"], check=True, capture_output=True)
     except Exception:
-        pass  # silent fail
+        pass
 
 @app.get("/update")
 async def update_data():
@@ -149,7 +107,7 @@ async def update_data():
     data_dir = base_dir / "ERM_Data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    cities = load_cities(base_dir)
+    cities = DEFAULT_CITIES
     erms = {city['name']: ERM_Live_Adaptive() for city in cities}
     previous_data = {city['name']: None for city in cities}
 
@@ -173,11 +131,7 @@ async def update_data():
         else:
             improvement = 0.0
 
-        Er_flux, next_predicted, beta = erm.step(
-            live_temp, data['humidity'], data['wind'], data['pressure'],
-            prev['live_temp'] if prev else None,
-            hour_of_day, city['local_avg_temp'], city['local_temp_range']
-        )
+        Er_flux, next_predicted, beta = erm.step(live_temp, data['humidity'], data['wind'], data['pressure'], prev['live_temp'] if prev else None, hour_of_day, city['local_avg_temp'], city['local_temp_range'])
 
         future = erm.predict_future([1, 3, 6, 12, 24, 48])
 
@@ -207,7 +161,6 @@ async def update_data():
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
-            f.flush()
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
 
