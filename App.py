@@ -12,7 +12,7 @@ import zipfile
 VERSION = "4.4"
 
 # ==================== YOUR GITHUB REPO (CHANGE ONCE) ====================
-GITHUB_REPO = "xanderosully/ERM"   # ←←← PUT YOUR ACTUAL USERNAME/REPO HERE
+GITHUB_REPO = "YOURUSERNAME/YOURREPO"   # ←←← PUT YOUR ACTUAL USERNAME/REPO HERE
 
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
@@ -137,6 +137,15 @@ def load_erm_data():
 st.set_page_config(page_title=f"ERM v{VERSION} Live", page_icon="🌡️", layout="wide")
 st.title("🌍 ERM v4.4 — Live Adaptive Weather Predictor + Saved ERM_Data")
 
+# ====================== LAST UPDATED BANNER ======================
+erm_data = load_erm_data()
+if erm_data:
+    latest_ts = max([df['timestamp'].max() for df in erm_data.values()])
+    minutes_ago = int((datetime.now() - latest_ts).total_seconds() / 60)
+    st.caption(f"**Last updated:** {minutes_ago} minutes ago (auto-refreshes every 10 min)")
+else:
+    st.caption("**Last updated:** Waiting for first data from background service...")
+
 with st.sidebar:
     st.header("Controls")
     available = [c["name"] for c in DEFAULT_CITIES]
@@ -222,7 +231,7 @@ if mode == "Live":
 else:
     erm_data = load_erm_data()
     if not erm_data:
-        st.info("📁 No ERM_Data files found yet.\n\nThe background worker is collecting live data and will create CSVs shortly.")
+        st.info("📁 No ERM_Data files found yet.\n\nThe background service is collecting live data and will create CSVs shortly.")
     else:
         st.success(f"✅ Loaded {len(erm_data)} cities from GitHub ERM_Data/")
         selected_saved_city = st.selectbox("Select city to view saved data", options=list(erm_data.keys()))
@@ -266,4 +275,4 @@ if mode == "Live" and auto_refresh:
         st.session_state.force_update = False
         st.rerun()
 
-st.caption("🚀 ERM v4.4 • Live + Auto-loaded GitHub ERM_Data")
+st.caption("🚀 ERM v4.4 • Live + Auto-loaded GitHub ERM_Data • Last updated banner active")
