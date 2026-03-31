@@ -87,7 +87,7 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
         "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": timezone
     }
-    for attempt in range(2):  # only 2 attempts
+    for attempt in range(2):
         try:
             resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
             resp.raise_for_status()
@@ -164,7 +164,7 @@ async def update_data():
         data = fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
         if not data:
             print(f"⚠️ Failed to fetch data for {city['name']}")
-            time.sleep(3)
+            time.sleep(10)
             continue
 
         live_temp = data['temp']
@@ -217,7 +217,7 @@ async def update_data():
         print(f"✅ CSV written for {city['name']} → {csv_path} ({csv_path.stat().st_size} bytes)")
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
-        time.sleep(3)  # rate-limit safety
+        time.sleep(10)  # ← 10-second safety delay between cities
 
     print("✅ All cities processed. Starting git backup...")
     git_backup(data_dir)
