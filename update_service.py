@@ -10,7 +10,7 @@ from datetime import datetime
 from collections import deque
 from pathlib import Path
 from typing import List, Dict, Optional
-import pandas as pd   # ← added for historical baseline loading
+import pandas as pd
 
 app = FastAPI(title="ERM Live Update Service")
 
@@ -82,12 +82,11 @@ class ERM_Live_Adaptive:
 
 
 def normalize_city_key(city_name: str) -> str:
-    """Make sure city names match between live and saved data."""
     return city_name.lower().replace(" ", "_").replace("-", "_")
 
 
 def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
-    """Load yesterday's same-hour temperature from the previous daily CSV (matches Streamlit logic)."""
+    """Same logic as Streamlit — uses yesterday's same-hour temp from CSV."""
     yesterday = datetime.now() - pd.Timedelta(days=1)
     yesterday_str = yesterday.strftime('%Y%m%d')
     csv_path = data_dir / f"erm_v{VERSION}_{normalize_city_key(city_name)}_{yesterday_str}.csv"
@@ -103,12 +102,12 @@ def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
             if not yesterday_same_hour.empty:
                 return float(yesterday_same_hour['live_temp'].mean())
         except Exception:
-            pass  # fall back below
-    # Fallback to local average if no historical data yet
+            pass
+    # Fallback
     for city in DEFAULT_CITIES:
         if normalize_city_key(city['name']) == normalize_city_key(city_name):
             return city['local_avg_temp']
-    return 15.0  # absolute safety fallback
+    return 15.0
 
 
 def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
@@ -169,11 +168,10 @@ async def update_data():
     base_dir = Path(__file__).parent
     data_dir = base_dir / "ERM_Data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    print(f"✅ Data directory ready: {data_dir}")
 
     cities = DEFAULT_CITIES
     erms = {city['name']: ERM_Live_Adaptive() for city in cities}
-    previous_data = {city['name']: None for city in cities}  # still kept for ERM internal state
+    previous_data = {city['name']: None for city in cities}
 
     now = datetime.now()
     today_str = now.strftime('%Y%m%d')
@@ -189,17 +187,14 @@ async def update_data():
         erm = erms[city['name']]
         prev = previous_data[city['name']]
 
-        # === NEW: Proper baseline using yesterday's same-hour data (matches Streamlit exactly) ===
         baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
 
-        # Run ERM step FIRST
         Er_flux, next_predicted, beta = erm.step(
             live_temp, data['humidity'], data['wind'], data['pressure'],
             prev['live_temp'] if prev else None,
             hour_of_day, city['local_avg_temp'], city['local_temp_range']
         )
 
-        # Calculate improvement with proper baseline
         erm_err = abs(live_temp - next_predicted)
         baseline_err = abs(live_temp - baseline_temp)
         improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01) if baseline_err > 0 else 0.0
@@ -234,12 +229,11 @@ async def update_data():
                 writer.writeheader()
             writer.writerow(row)
 
-        print(f"✅ Appended row to {city['name']} → {csv_path} (improvement: {improvement:.1f}%)")
+        print(f"✅ Updated {city['name']} → improvement {improvement:.1f}%")
 
         previous_data[city['name']] = {'live_temp': live_temp, 'next_predicted': next_predicted}
-        time.sleep(10)  # gentle rate limiting
+        time.sleep(8)
 
-    print("✅ All cities processed. Starting git backup...")
     git_backup(data_dir)
     return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
 
