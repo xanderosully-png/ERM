@@ -1,0 +1,31 @@
+services:
+  # 1. Your existing FastAPI backend (the one that runs /update)
+  - type: web
+    name: erm-forecast-backend
+    runtime: python
+    region: ohio
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn update_service:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: xanderosully-png/ERM
+        sync: false
+      - key: ERM_SEMAPHORE_LIMIT
+        value: "5"
+        sync: false
+    autoDeploy: true
+
+  # 2. New Streamlit dashboard (visualization)
+  - type: web
+    name: erm-forecast-dashboard
+    runtime: python
+    region: ohio
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run dashboard.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    healthCheckPath: /_stcore/health
+    autoDeploy: true
