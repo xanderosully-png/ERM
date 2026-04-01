@@ -10,15 +10,15 @@ from collections import deque
 from pathlib import Path
 
 # =============================================
-# DEFAULT_CITIES — MAIN CITIES + NEIGHBORS INCLUDED
+# DEFAULT_CITIES — MAIN CITIES + NEIGHBORS
 # =============================================
 DEFAULT_CITIES = [
     {"name": "Columbus",     "backend_key": "Columbus_OH", "neighbors": ["Pataskala", "Cleveland"]},
-    {"name": "Miami",        "backend_key": "Miami_FL",    "neighbors": []},
-    {"name": "New York",     "backend_key": "New_York_NY", "neighbors": []},
-    {"name": "Los Angeles",  "backend_key": "Los_Angeles_CA", "neighbors": []},
-    {"name": "London",       "backend_key": "London_UK",   "neighbors": []},
-    {"name": "Tokyo",        "backend_key": "Tokyo_JP",    "neighbors": []},
+    {"name": "Miami",        "backend_key": "Miami_FL",    "neighbors": ["Fort Lauderdale", "West Palm Beach"]},
+    {"name": "New York",     "backend_key": "New_York_NY", "neighbors": ["Philadelphia", "Boston"]},
+    {"name": "Los Angeles",  "backend_key": "Los_Angeles_CA", "neighbors": ["San Diego", "San Francisco"]},
+    {"name": "London",       "backend_key": "London_UK",   "neighbors": ["Manchester", "Birmingham"]},
+    {"name": "Tokyo",        "backend_key": "Tokyo_JP",    "neighbors": ["Yokohama", "Osaka"]},
 ]
 
 # =============================================
@@ -67,14 +67,24 @@ with tab1:
             st.rerun()
 
     st.caption("📡 Fetching latest ERM predictions from backend...")
-    try:
-        response = requests.get("https://ermforecast.onrender.com/latest", timeout=15)
-        response.raise_for_status()
-        latest_records = response.json()
-        st.success(f"✅ Backend data loaded — {len(latest_records)} cities")
-    except Exception as e:
-        st.error(f"❌ Failed to fetch from FastAPI backend: {e}")
-        st.stop()
+
+    # === IMPROVED FETCH WITH RETRY + LONGER TIMEOUT ===
+    latest_records = None
+    for attempt in range(3):
+        try:
+            response = requests.get("https://ermforecast.onrender.com/latest", timeout=60)
+            response.raise_for_status()
+            latest_records = response.json()
+            st.success(f"✅ Backend data loaded — {len(latest_records)} cities")
+            break
+        except Exception as e:
+            if attempt < 2:
+                st.warning(f"⚠️ Attempt {attempt+1} failed — retrying in 3 seconds...")
+                import time
+                time.sleep(3)
+            else:
+                st.error(f"❌ Failed to fetch from FastAPI backend after 3 tries:\n{e}")
+                st.stop()
 
     def normalize(name: str) -> str:
         return str(name).lower().replace("_", "").replace(" ", "").replace("-", "")
@@ -89,7 +99,6 @@ with tab1:
 
         st.caption(f"📍 Processing **{display_name}**...")
 
-        # Find main city data
         data = None
         for record in latest_records:
             if normalize(record.get("city")) == normalize(backend_key):
@@ -134,21 +143,18 @@ with tab1:
             fig.update_layout(height=300, margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
-        # === NEIGHBOR CITIES SECTION ===
         if neighbors:
             st.caption(f"🧭 Neighbors of {display_name}:")
             neighbor_col1, neighbor_col2 = st.columns([1, 3])
             with neighbor_col1:
                 for neigh in neighbors:
-                    # Use main city's data as proxy (geographically close)
                     st.metric(
                         label=neigh,
                         value=f"{to_unit(live_temp_c, unit):.1f}{unit}",
                         delta=f"Pred 1h: {to_unit(next_predicted_c, unit):.1f}{unit} (proxy)"
                     )
             with neighbor_col2:
-                st.info("🔄 These neighbors currently use Columbus_OH data as a close proxy.\n"
-                        "Add them to your FastAPI DEFAULT_CITIES for full independent predictions!")
+                st.info("🔄 Using nearby main-city data as proxy.\nAdd them to FastAPI DEFAULT_CITIES for full independent predictions!")
 
 with tab2:
     st.subheader("Saved ERM_Data Mode")
