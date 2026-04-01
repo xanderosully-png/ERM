@@ -37,46 +37,45 @@ app = FastAPI(title="ERM Live Update Service — V5.4-clean", lifespan=lifespan)
 
 VERSION = "5.4-clean"
 
-# ==================== DEFAULT_CITIES (6 main + 12 full neighbors) ====================
-DEFAULT_CITIES = [
-    # Main cities
-    {"name": "Columbus_OH",     "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
-    {"name": "Miami_FL",        "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
-    {"name": "New_York_NY",     "lat": 40.7128, "lon": -74.0060, "tz": "America/New_York", "local_avg_temp": 12.0, "local_temp_range": 32.0},
-    {"name": "Los_Angeles_CA",  "lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles", "local_avg_temp": 18.0, "local_temp_range": 20.0},
-    {"name": "London_UK",       "lat": 51.5074, "lon": -0.1278, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
-    {"name": "Tokyo_JP",        "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 28.0},
+# ==================== HAVERSINE ====================
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
-    # === Neighbors for Columbus_OH ===
+# ==================== DEFAULT_CITIES (18 cities) ====================
+DEFAULT_CITIES = [
+    {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
+    {"name": "Miami_FL",    "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
+    {"name": "New_York_NY", "lat": 40.7128, "lon": -74.0060, "tz": "America/New_York", "local_avg_temp": 12.0, "local_temp_range": 32.0},
+    {"name": "Los_Angeles_CA", "lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles", "local_avg_temp": 18.0, "local_temp_range": 20.0},
+    {"name": "London_UK",   "lat": 51.5074, "lon": -0.1278, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
+    {"name": "Tokyo_JP",    "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 28.0},
+    # Neighbors
     {"name": "Pataskala_OH",    "lat": 39.9956, "lon": -82.6743, "tz": "America/New_York", "local_avg_temp": 12.5, "local_temp_range": 22.0},
     {"name": "Cleveland_OH",    "lat": 41.4993, "lon": -81.6944, "tz": "America/New_York", "local_avg_temp": 10.5, "local_temp_range": 19.0},
-
-    # === Neighbors for Miami_FL ===
     {"name": "Fort_Lauderdale_FL", "lat": 26.1224, "lon": -80.1373, "tz": "America/New_York", "local_avg_temp": 25.5, "local_temp_range": 14.0},
     {"name": "West_Palm_Beach_FL", "lat": 26.7153, "lon": -80.0534, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
-
-    # === Neighbors for New_York_NY ===
     {"name": "Philadelphia_PA", "lat": 39.9526, "lon": -75.1652, "tz": "America/New_York", "local_avg_temp": 12.5, "local_temp_range": 31.0},
     {"name": "Boston_MA",       "lat": 42.3601, "lon": -71.0589, "tz": "America/New_York", "local_avg_temp": 11.0, "local_temp_range": 33.0},
-
-    # === Neighbors for Los_Angeles_CA ===
     {"name": "San_Diego_CA",    "lat": 32.7157, "lon": -117.1611, "tz": "America/Los_Angeles", "local_avg_temp": 18.5, "local_temp_range": 18.0},
     {"name": "San_Francisco_CA","lat": 37.7749, "lon": -122.4194, "tz": "America/Los_Angeles", "local_avg_temp": 15.0, "local_temp_range": 22.0},
-
-    # === Neighbors for London_UK ===
     {"name": "Manchester_UK",   "lat": 53.4808, "lon": -2.2426, "tz": "Europe/London", "local_avg_temp": 10.5, "local_temp_range": 24.0},
     {"name": "Birmingham_UK",   "lat": 52.4862, "lon": -1.8904, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
-
-    # === Neighbors for Tokyo_JP ===
     {"name": "Yokohama_JP",     "lat": 35.4437, "lon": 139.6380, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 27.0},
     {"name": "Osaka_JP",        "lat": 34.6937, "lon": 135.5023, "tz": "Asia/Tokyo", "local_avg_temp": 16.5, "local_temp_range": 28.0},
 ]
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# ==================== (EVERYTHING ELSE BELOW IS UNCHANGED) ====================
-# ERM CLASS, HELPERS, /UPDATE, /LATEST, etc. — exactly the same as you posted
-
+# ==================== ERM CLASS (unchanged) ====================
 class ERM_Live_Adaptive:
     def __init__(self, history_size: int = 10):
         self.history_size = history_size
@@ -229,6 +228,7 @@ class ERM_Live_Adaptive:
             last = float(self.Er_history[-1]) if self.Er_history else 0.0
             return {s: last for s in steps_list}
 
+# ==================== HELPERS ====================
 def normalize_city_key(city_name: str) -> str:
     return city_name.lower().replace(" ", "_").replace("-", "_")
 
@@ -342,7 +342,7 @@ def git_backup(data_dir: Path):
 
     threading.Thread(target=do_backup, daemon=True).start()
 
-# ==================== /UPDATE ENDPOINT ====================
+# ==================== /UPDATE ENDPOINT (optimized) ====================
 update_lock = asyncio.Lock()
 
 @app.get("/update")
@@ -364,25 +364,73 @@ async def update_data(background_tasks: BackgroundTasks):
         today_str = now.strftime('%Y%m%d')
         hour_of_day = now.hour
 
-        sem_limit = int(os.getenv("ERM_SEMAPHORE_LIMIT", 5))
-        sem = asyncio.Semaphore(sem_limit)
+        # Step 1: Fetch live data for ALL cities (separate meteo reader)
+        live_data_dict = {}
+        sem = asyncio.Semaphore(int(os.getenv("ERM_SEMAPHORE_LIMIT", 5)))
 
-        async def fetch_and_update(city):
+        async def fetch_city(city):
             async with sem:
                 data = await fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
-                if not data or data.get('temp') is None:
-                    logger.warning(f"Skipped {city['name']} — no temperature data")
+                return city['name'], data
+
+        results = await asyncio.gather(*(fetch_city(city) for city in cities), return_exceptions=True)
+
+        for name, data in zip([c['name'] for c in cities], results):
+            if isinstance(data, Exception) or not data or data.get('temp') is None:
+                logger.warning(f"Skipped {name} — no temperature data")
+                continue
+            live_data_dict[name] = data
+
+        # Step 2: True relative pressure gradient (your requested leap)
+        def calculate_neighbor_influence(city_name: str, live_data_dict: Dict) -> float:
+            influence = 0.0
+            city = next((c for c in cities if c['name'] == city_name), None)
+            if not city or city_name not in live_data_dict:
+                return 0.0
+
+            current_pressure = live_data_dict[city_name].get('pressure', 1013)
+
+            for other_name, other_data in live_data_dict.items():
+                if other_name == city_name:
+                    continue
+                other_city = next((c for c in cities if c['name'] == other_name), None)
+                if not other_city:
+                    continue
+                dist = haversine(city['lat'], city['lon'], other_city['lat'], other_city['lon'])
+                pressure_diff = other_data.get('pressure', 1013) - current_pressure   # ← RELATIVE GRADIENT
+                raw = (pressure_diff / max(dist, 0.1)) * 0.1
+                normalized = raw / 1000.0
+                influence += normalized * math.exp(-dist / 1000.0)
+            return influence
+
+        # Step 3: Optimized process_city
+        sem = asyncio.Semaphore(int(os.getenv("ERM_SEMAPHORE_LIMIT", 5)))
+
+        async def process_city(city):
+            async with sem:
+                data = live_data_dict.get(city['name'])
+                if not data:
                     return city['name'], False
 
                 live_temp = data['temp']
                 erm = erms[city['name']]
                 baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
 
-                Er_flux, next_predicted, beta, _ = erm.step(
-                    live_temp, data['humidity'], data['wind'], data['pressure'],
-                    0.0, 50.0, 0.0,
-                    erm.history[-1] if len(erm.history) > 0 else None,
-                    hour_of_day, city.get('local_avg_temp', 15.0), city.get('local_temp_range', 30.0),
+                neighbor_influence = calculate_neighbor_influence(city['name'], live_data_dict)
+
+                Er_flux, next_predicted, beta, pressure_trend = erm.step(
+                    current_temp=live_temp,
+                    current_humidity=data.get('humidity', 50),
+                    current_wind=data.get('wind', 5),
+                    current_pressure=data.get('pressure', 1013),
+                    current_rain_prob=0.0,
+                    current_cloud_cover=50.0,
+                    current_solar=0.0,
+                    previous_temp=erm.history[-1] if len(erm.history) > 0 else None,
+                    hour_of_day=hour_of_day,
+                    local_avg_temp=city.get('local_avg_temp', 15.0),
+                    local_temp_range=city.get('local_temp_range', 30.0),
+                    neighbor_influence=neighbor_influence,
                     city_name=city['name']
                 )
 
@@ -402,9 +450,9 @@ async def update_data(background_tasks: BackgroundTasks):
                     'timestamp': data['time'],
                     'timestamp_utc': datetime.utcnow().isoformat(),
                     'live_temp': live_temp,
-                    'humidity': data['humidity'],
-                    'wind': data['wind'],
-                    'pressure': data['pressure'],
+                    'humidity': data.get('humidity'),
+                    'wind': data.get('wind'),
+                    'pressure': data.get('pressure'),
                     'erm_flux': Er_flux,
                     'beta': beta,
                     'baseline_temp': baseline_temp,
@@ -420,19 +468,19 @@ async def update_data(background_tasks: BackgroundTasks):
                 file_exists = csv_path.exists()
                 pd.DataFrame([row]).to_csv(csv_path, mode='a', header=not file_exists, index=False)
 
-                logger.info(f"✅ Updated {city['name']} → improvement {improvement:.1f}% | error {realized_error:.3f}")
+                logger.info(f"✅ Updated {city['name']} (influence {neighbor_influence:.4f}) → improvement {improvement:.1f}%")
                 state_file = state_dir / f"erm_state_{normalize_city_key(city['name'])}.json"
                 erm.save_state(state_file)
                 return city['name'], True
 
-        results = await asyncio.gather(*(fetch_and_update(city) for city in cities), return_exceptions=True)
+        results = await asyncio.gather(*(process_city(city) for city in cities), return_exceptions=True)
         successful = sum(1 for r in results if not isinstance(r, Exception) and r[1] is True)
 
     backfill_realized_errors(data_dir)
     background_tasks.add_task(git_backup, data_dir)
     return {"status": "success", "updated": len(cities), "successful": successful, "time": datetime.now().isoformat()}
 
-# ==================== /LATEST ENDPOINT ====================
+# ==================== /LATEST ====================
 @app.get("/latest")
 async def get_latest():
     data_dir = Path(__file__).parent / "ERM_Data"
@@ -443,18 +491,19 @@ async def get_latest():
             df = pd.read_csv(csv_path)
             if df.empty:
                 continue
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            latest_row = df.loc[df['timestamp'].idxmax()]
+            row = latest_row.to_dict()
 
             filename = csv_path.name
             city_part = filename.replace("erm_v4.4_", "").split("_20")[0]
             city_name = city_part.replace("_", " ").title().replace(" ", "_")
-
-            row = df.iloc[-1].to_dict()
             row["city"] = city_name
             latest_data.append(row)
         except Exception as e:
             logger.warning(f"Could not read latest from {csv_path.name}: {e}")
 
-    logger.info(f"📡 /latest served {len(latest_data)} cities")
+    logger.info(f"📡 /latest served {len(latest_data)} fresh cities")
     return latest_data
 
 # ==================== HEALTH ====================
