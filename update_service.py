@@ -2,25 +2,38 @@ from fastapi import FastAPI, BackgroundTasks
 from contextlib import asynccontextmanager
 import uvicorn
 import os
-import subprocess  # ← needed for git_backup
+import subprocess
 import numpy as np
 import httpx
 import asyncio
 import pandas as pd
 import logging
 import threading
-from datetime import datetime, timedelta  # ← added timedelta
+from datetime import datetime, timedelta
 from collections import deque, defaultdict
 from pathlib import Path
 from typing import List, Dict, Optional
 import math
-from zoneinfo import ZoneInfo
 import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="ERM Live Update Service — V5.2")
+# ==================== LIFESPAN (modern FastAPI) ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=10, max_keepalive_connections=5))
+    base_dir = Path(__file__).parent
+    (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
+    (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
+    logger.info("🚀 V5.2 HTTP client initialized and directories ready")
+    yield
+    if http_client:
+        await http_client.aclose()
+    logger.info("🛑 V5.2 HTTP client closed")
+
+app = FastAPI(title="ERM Live Update Service — V5.2", lifespan=lifespan)
 
 VERSION = "5.2"
 
@@ -153,7 +166,7 @@ class ERM_Live_Adaptive:
         f_field = base * (rhoE ** 0.5) * (tauE ** 0.5)
         f_field += neighbor_influence * 0.4
 
-        # FIXED: prevent NaN when sum_decayed is negative
+        # FIXED: prevent NaN on negative power
         recursive = 0.0
         if self.Er_history:
             times = np.arange(len(self.Er_history), 0, -1, dtype=np.float32)
@@ -162,7 +175,7 @@ class ERM_Live_Adaptive:
             if sum_decayed >= 0:
                 recursive = sum_decayed ** self.alpha
             else:
-                recursive = - (np.abs(sum_decayed) ** self.alpha)
+                recursive = -(np.abs(sum_decayed) ** self.alpha)
 
         field_limit = max(50, np.std(self.history) * 3) if len(self.history) > 1 else 200
         Er_new = np.clip(f_field + (self.lambda_damp * recursive) + correction, -field_limit, field_limit)
@@ -198,10 +211,9 @@ class ERM_Live_Adaptive:
             last = float(self.Er_history[-1]) if self.Er_history else 0.0
             return {s: last for s in steps_list}
 
-# ==================== YOUR ORIGINAL HELPERS (with fixes) ====================
+# ==================== HELPERS (with ISO8601 fix) ====================
 def normalize_city_key(city_name: str) -> str:
     return city_name.lower().replace(" ", "_").replace("-", "_")
-
 
 def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
     yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
@@ -216,12 +228,10 @@ def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
                 return float(yesterday_same_hour['live_temp'].mean())
         except Exception:
             pass
-    # fallback to default average
     for city in DEFAULT_CITIES:
         if normalize_city_key(city['name']) == normalize_city_key(city_name):
             return city.get('local_avg_temp', 15.0)
     return 15.0
-
 
 async def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
     params = {
@@ -253,7 +263,6 @@ async def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Op
                 await asyncio.sleep(2 ** attempt)
     return None
 
-
 def backfill_realized_errors(data_dir: Path):
     logger.info("🔄 Back-filling realized prediction errors...")
     today_str = datetime.now().strftime('%Y%m%d')
@@ -278,7 +287,6 @@ def backfill_realized_errors(data_dir: Path):
             logger.info(f"✅ Back-filled errors for {csv_path.name}")
         except Exception as e:
             logger.warning(f"⚠️ Backfill skipped for {csv_path.name}: {e}")
-
 
 def git_backup(data_dir: Path):
     def do_backup():
@@ -311,8 +319,7 @@ def git_backup(data_dir: Path):
 
     threading.Thread(target=do_backup, daemon=True).start()
 
-
-# ==================== FIXED /update ENDPOINT ====================
+# ==================== /update ENDPOINT ====================
 update_lock = asyncio.Lock()
 
 @app.get("/update")
@@ -348,19 +355,11 @@ async def update_data(background_tasks: BackgroundTasks):
                 erm = erms[city['name']]
                 baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
 
-                # V5 step() now expects rain_prob, cloud_cover, solar (we pass safe defaults)
                 Er_flux, next_predicted, beta, _ = erm.step(
-                    live_temp,
-                    data['humidity'],
-                    data['wind'],
-                    data['pressure'],
-                    0.0,           # current_rain_prob (Open-Meteo doesn't provide yet)
-                    50.0,          # current_cloud_cover (dummy)
-                    0.0,           # current_solar (dummy)
+                    live_temp, data['humidity'], data['wind'], data['pressure'],
+                    0.0, 50.0, 0.0,                                      # rain, cloud, solar (Open-Meteo fallback)
                     erm.history[-1] if len(erm.history) > 0 else None,
-                    hour_of_day,
-                    city.get('local_avg_temp', 15.0),
-                    city.get('local_temp_range', 30.0),
+                    hour_of_day, city.get('local_avg_temp', 15.0), city.get('local_temp_range', 30.0),
                     city_name=city['name']
                 )
 
@@ -417,23 +416,6 @@ async def update_data(background_tasks: BackgroundTasks):
 async def health():
     return {"status": "healthy", "version": "V5.2 Context-Aware Relational (final)"}
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global http_client
-    http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=10, max_keepalive_connections=5))
-    base_dir = Path(__file__).parent
-    (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
-    (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
-    logger.info("🚀 V5.2 HTTP client initialized and directories ready")
-    yield
-    if http_client:
-        await http_client.aclose()
-    logger.info("🛑 V5.2 HTTP client closed")
-
-
-# Re-apply lifespan (FastAPI requires it at the end)
-app = FastAPI(title="ERM Live Update Service — V5.2", lifespan=lifespan)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
