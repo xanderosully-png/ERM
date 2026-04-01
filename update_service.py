@@ -27,15 +27,15 @@ async def lifespan(app: FastAPI):
     base_dir = Path(__file__).parent
     (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
     (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
-    logger.info("🚀 V5.3 HTTP client initialized and directories ready")
+    logger.info("🚀 V5.3-final HTTP client initialized")
     yield
     if http_client:
         await http_client.aclose()
-    logger.info("🛑 V5.3 HTTP client closed")
+    logger.info("🛑 V5.3-final HTTP client closed")
 
-app = FastAPI(title="ERM Live Update Service — V5.3", lifespan=lifespan)
+app = FastAPI(title="ERM Live Update Service — V5.3-final", lifespan=lifespan)
 
-VERSION = "5.3"
+VERSION = "5.3-final"
 
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
@@ -48,7 +48,7 @@ DEFAULT_CITIES = [
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# ==================== ERM CLASS (must be before /update) ====================
+# ==================== ERM CLASS (MUST be BEFORE the /update route) ====================
 class ERM_Live_Adaptive:
     def __init__(self, history_size: int = 10):
         self.history_size = history_size
@@ -401,8 +401,7 @@ async def update_data(background_tasks: BackgroundTasks):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "V5.3 Context-Aware Relational (final)"}
-
+    return {"status": "healthy", "version": "V5.3-final Context-Aware Relational"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
