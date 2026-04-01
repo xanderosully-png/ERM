@@ -2,8 +2,8 @@ name: ERM Live Update
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes
-  workflow_dispatch:         # allows manual trigger
+    - cron: '*/5 * * * *'   # ← tightened to every 5 minutes
+  workflow_dispatch:         # allows manual trigger from GitHub UI
 
 jobs:
   update:
