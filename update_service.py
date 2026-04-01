@@ -27,29 +27,24 @@ DEFAULT_CITIES = [
 ]
 
 class ERM_Live_Adaptive:
-    def __init__(self, history_size: int = 10, gamma: float = 0.935, lambda_damp: float = 0.28, alpha: float = 0.75):
+    def __init__(self, history_size: int = 10):
         self.history_size = history_size
-        self.history: deque[float] = deque(maxlen=history_size)
-        self.humidity_history: deque[float] = deque(maxlen=history_size)
-        self.wind_history: deque[float] = deque(maxlen=history_size)
-        self.pressure_history: deque[float] = deque(maxlen=history_size)
-        self.Er_history: deque[float] = deque(maxlen=history_size)
-        self.gamma = gamma
-        self.lambda_damp = lambda_damp
-        self.alpha = alpha
-        self.error_feedback = 0.0  # ← self-tuning bias from past errors
+        self.history: deque = deque(maxlen=history_size)
+        self.humidity_history: deque = deque(maxlen=history_size)
+        self.wind_history: deque = deque(maxlen=history_size)
+        self.pressure_history: deque = deque(maxlen=history_size)
+        self.Er_history: deque = deque(maxlen=history_size)
+        self.error_history: deque = deque(maxlen=20)
+        self.gamma = 0.935
+        self.lambda_damp = 0.28
+        self.alpha = 0.75
 
     def save_state(self, filepath: Path):
         state = {
-            "history": list(self.history),
-            "humidity_history": list(self.humidity_history),
-            "wind_history": list(self.wind_history),
-            "pressure_history": list(self.pressure_history),
-            "Er_history": list(self.Er_history),
-            "gamma": self.gamma,
-            "lambda_damp": self.lambda_damp,
-            "alpha": self.alpha,
-            "error_feedback": self.error_feedback
+            "history": list(self.history), "humidity_history": list(self.humidity_history),
+            "wind_history": list(self.wind_history), "pressure_history": list(self.pressure_history),
+            "Er_history": list(self.Er_history), "error_history": list(self.error_history),
+            "gamma": self.gamma, "lambda_damp": self.lambda_damp, "alpha": self.alpha
         }
         filepath.write_text(json.dumps(state))
 
@@ -62,44 +57,68 @@ class ERM_Live_Adaptive:
                 self.wind_history.extend(state.get("wind_history", []))
                 self.pressure_history.extend(state.get("pressure_history", []))
                 self.Er_history.extend(state.get("Er_history", []))
+                self.error_history.extend(state.get("error_history", []))
                 self.gamma = state.get("gamma", self.gamma)
                 self.lambda_damp = state.get("lambda_damp", self.lambda_damp)
                 self.alpha = state.get("alpha", self.alpha)
-                self.error_feedback = state.get("error_feedback", 0.0)
             except Exception:
-                pass  # start fresh if corrupted
+                pass
 
-    def _derive_variables(self, current_temp: float, current_humidity: float, current_wind: float, current_pressure: float, previous_temp: Optional[float], hour_of_day: int, local_avg_temp: float, local_temp_range: float):
+    def record_error(self, error: float):
+        self.error_history.append(error)
+
+    def step(self, current_temp, current_humidity, current_wind, current_pressure,
+             previous_temp, hour_of_day, local_avg_temp, local_temp_range):
         self.history.append(current_temp)
         self.humidity_history.append(current_humidity)
         self.wind_history.append(current_wind)
         self.pressure_history.append(current_pressure)
 
         if len(self.history) < 2:
-            return 4.0, 0.85, 0.0, 1.0, 1.05, 0.97
+            return 0.0, current_temp, 1.0
 
         recent_t = np.array(self.history, dtype=np.float32)
         diffs = np.diff(recent_t)
         Nr = len(recent_t) * (1 + np.var(recent_t) / 10)
         Tr = max(0.6, 1 - np.std(diffs) / (np.mean(np.abs(diffs)) + 1e-6)) * (1 - np.mean(self.humidity_history) / 200)
+
+        # === ADAPTIVE SELF-CORRECTION (Upgrades #1 + #2) ===
+        recent_error = 0.0
+        if self.error_history:
+            weights = np.linspace(1.0, 0.2, len(self.error_history))
+            recent_error = np.average(self.error_history, weights=weights)
+
+        error_factor = np.tanh(abs(recent_error) / 5.0)
+        learning_rate = 0.05 + 0.25 * error_factor
+
+        if len(self.error_history) > 1 and np.sign(self.error_history[-1]) != np.sign(self.error_history[-2]):
+            learning_rate *= 0.5  # damp oscillation
+
+        Tr = Tr * (1 - 0.3 * error_factor)
+        correction = learning_rate * recent_error
+
         dphi = current_temp - previous_temp if previous_temp is not None else 0.0
         k = 0.8 + np.mean(np.abs(diffs)) / 5 + np.mean(self.wind_history) / 50
         rhoE = 1.0 + ((np.mean(recent_t) - local_avg_temp) / local_temp_range) + (np.mean(self.pressure_history) - 1013) / 1000
         tauE = 0.95 + (hour_of_day / 48)
-        return Nr, Tr, dphi, k, rhoE, tauE
 
-    def step(self, current_temp: float, current_humidity: float, current_wind: float, current_pressure: float, previous_temp: Optional[float], hour_of_day: int, local_avg_temp: float, local_temp_range: float):
-        Nr, Tr, dphi, k, rhoE, tauE = self._derive_variables(current_temp, current_humidity, current_wind, current_pressure, previous_temp, hour_of_day, local_avg_temp, local_temp_range)
         base = (Nr * Tr * dphi) / max(k, 1e-8)
         f_field = base * (rhoE ** 0.5) * (tauE ** 0.5)
+
         recursive = 0.0
         if self.Er_history:
             times = np.arange(len(self.Er_history), 0, -1, dtype=np.float32)
             decayed = np.array(self.Er_history, dtype=np.float32) * (self.gamma ** times)
             recursive = np.sum(decayed) ** self.alpha
-        Er_new = np.clip(f_field + (self.lambda_damp * recursive), -200, 200)
+
+        Er_new = np.clip(f_field + (self.lambda_damp * recursive) + correction, -200, 200)
         self.Er_history.append(Er_new)
-        beta = np.clip(np.std(self.history) / (np.std(self.Er_history) + 1e-6), max(0.01, np.std(self.history)/50), max(1.0, np.std(self.history)/2))
+
+        beta = np.clip(np.std(self.history) / (np.std(self.Er_history) + 1e-6),
+                       max(0.01, np.std(self.history)/50),
+                       max(1.0, np.std(self.history)/2))
+        beta = beta * (1 - 0.2 * error_factor)
+
         next_predicted = current_temp + (Er_new * beta)
         return Er_new, next_predicted, beta
 
@@ -125,10 +144,7 @@ def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
         try:
             df = pd.read_csv(csv_path)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
-            yesterday_same_hour = df[
-                (df['timestamp'].dt.date == yesterday.date()) &
-                (df['timestamp'].dt.hour == hour)
-            ]
+            yesterday_same_hour = df[(df['timestamp'].dt.date == yesterday.date()) & (df['timestamp'].dt.hour == hour)]
             if not yesterday_same_hour.empty:
                 return float(yesterday_same_hour['live_temp'].mean())
         except Exception:
@@ -140,13 +156,9 @@ def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
 
 
 def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
-        "daily": "temperature_2m_max,temperature_2m_min",
-        "timezone": timezone
-    }
+    params = {"latitude": lat, "longitude": lon,
+              "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
+              "daily": "temperature_2m_max,temperature_2m_min", "timezone": timezone}
     for attempt in range(2):
         try:
             resp = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
@@ -154,15 +166,11 @@ def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional
             data = resp.json()
             current = data['current']
             daily = data['daily']
-            return {
-                'temp': current['temperature_2m'],
-                'humidity': current['relative_humidity_2m'],
-                'wind': current['wind_speed_10m'],
-                'pressure': current['surface_pressure'],
-                'time': datetime.now().isoformat(),
-                'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
-                'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None
-            }
+            return {'temp': current['temperature_2m'], 'humidity': current['relative_humidity_2m'],
+                    'wind': current['wind_speed_10m'], 'pressure': current['surface_pressure'],
+                    'time': datetime.now().isoformat(),
+                    'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
+                    'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None}
         except Exception:
             if attempt < 1:
                 time.sleep(3)
@@ -176,7 +184,6 @@ def backfill_realized_errors(data_dir: Path):
             df = pd.read_csv(csv_path)
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.sort_values('timestamp').reset_index(drop=True)
-
             horizons = [1, 3, 6, 12, 24, 48]
             for h in horizons:
                 pred_col = f'next_predicted_{h}h'
@@ -184,25 +191,18 @@ def backfill_realized_errors(data_dir: Path):
                 if pred_col not in df.columns:
                     df[error_col] = np.nan
                     continue
-
                 df['shifted_time'] = df['timestamp'] + pd.Timedelta(hours=h)
                 actual_map = dict(zip(df['timestamp'], df['live_temp']))
-
                 def compute_error(row):
                     target_time = row['shifted_time']
-                    closest = min(
-                        (t for t in actual_map if abs((t - target_time).total_seconds()) <= 900),
-                        key=lambda t: abs((t - target_time).total_seconds()),
-                        default=None
-                    )
+                    closest = min((t for t in actual_map if abs((t - target_time).total_seconds()) <= 900),
+                                  key=lambda t: abs((t - target_time).total_seconds()), default=None)
                     if closest is not None:
                         return actual_map[closest] - row[pred_col]
                     return np.nan
-
                 df[error_col] = df.apply(compute_error, axis=1)
-
             df.drop(columns=['shifted_time'], errors='ignore').to_csv(csv_path, index=False)
-            print(f"✅ Back-filled errors for {csv_path.name} ({len(df)} rows)")
+            print(f"✅ Back-filled errors for {csv_path.name}")
         except Exception as e:
             print(f"⚠️ Backfill skipped for {csv_path.name}: {e}")
 
@@ -221,7 +221,7 @@ def git_backup(data_dir: Path):
         subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "add", str(data_dir)], cwd=repo_root, check=True, capture_output=True)
-        subprocess.run(["git", "add", str(data_dir.parent / "ERM_State")], cwd=repo_root, check=True, capture_output=True)  # also commit state
+        subprocess.run(["git", "add", str(data_dir.parent / "ERM_State")], cwd=repo_root, check=True, capture_output=True)
         subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
         commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], cwd=repo_root, capture_output=True, text=True)
         if commit_result.returncode == 0:
@@ -244,7 +244,7 @@ async def update_data():
     for city in cities:
         erm = ERM_Live_Adaptive()
         state_file = state_dir / f"erm_state_{city['name'].lower().replace(' ', '_')}.json"
-        erm.load_state(state_file)          # ← PERSISTENT LOAD
+        erm.load_state(state_file)
         erms[city['name']] = erm
 
     now = datetime.now()
@@ -259,7 +259,6 @@ async def update_data():
 
         live_temp = data['temp']
         erm = erms[city['name']]
-        prev = None  # we no longer need previous_data dict — state is now persistent
 
         baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
 
@@ -269,6 +268,10 @@ async def update_data():
             hour_of_day, city['local_avg_temp'], city['local_temp_range']
         )
 
+        # === CLOSED-LOOP FEEDBACK ===
+        realized_error = live_temp - next_predicted
+        erm.record_error(realized_error)
+
         erm_err = abs(live_temp - next_predicted)
         baseline_err = abs(live_temp - baseline_temp)
         improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01) if baseline_err > 0 else 0.0
@@ -276,22 +279,16 @@ async def update_data():
         future = erm.predict_future([1, 3, 6, 12, 24, 48])
 
         row = {
-            'timestamp': data['time'],
-            'live_temp': live_temp,
-            'humidity': data['humidity'],
-            'wind': data['wind'],
-            'pressure': data['pressure'],
-            'erm_flux': Er_flux,
-            'beta': beta,
-            'baseline_temp': baseline_temp,
+            'timestamp': data['time'], 'live_temp': live_temp,
+            'humidity': data['humidity'], 'wind': data['wind'], 'pressure': data['pressure'],
+            'erm_flux': Er_flux, 'beta': beta, 'baseline_temp': baseline_temp,
             'next_predicted_1h': next_predicted + (future[1] * beta),
             'next_predicted_3h': next_predicted + (future[3] * beta),
             'next_predicted_6h': next_predicted + (future[6] * beta),
             'next_predicted_12h': next_predicted + (future[12] * beta),
             'next_predicted_24h': next_predicted + (future[24] * beta),
             'next_predicted_48h': next_predicted + (future[48] * beta),
-            'tomorrow_max': data.get('tomorrow_max'),
-            'tomorrow_min': data.get('tomorrow_min'),
+            'tomorrow_max': data.get('tomorrow_max'), 'tomorrow_min': data.get('tomorrow_min'),
             'improvement_pct': improvement,
             'error_1h': np.nan, 'error_3h': np.nan, 'error_6h': np.nan,
             'error_12h': np.nan, 'error_24h': np.nan, 'error_48h': np.nan
@@ -299,23 +296,17 @@ async def update_data():
 
         csv_path = data_dir / f"erm_v{VERSION}_{city['name'].lower().replace(' ', '_')}_{today_str}.csv"
         file_exists = csv_path.exists()
-
         with open(csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=row.keys())
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
 
-        # === RECURSIVE FEEDBACK: self-tune based on this prediction's error ===
-        recent_error = (live_temp - next_predicted) * 0.1
-        erm.error_feedback = 0.7 * erm.error_feedback + 0.3 * recent_error
-        erm.lambda_damp = max(0.1, min(0.4, erm.lambda_damp + erm.error_feedback * 0.0005))
+        print(f"✅ Updated {city['name']} → improvement {improvement:.1f}% | error {realized_error:.3f}")
 
-        # Save persistent state for next run
+        # Save persistent state (now includes error_history)
         state_file = state_dir / f"erm_state_{city['name'].lower().replace(' ', '_')}.json"
         erm.save_state(state_file)
-
-        print(f"✅ Updated {city['name']} → improvement {improvement:.1f}% | error_feedback {erm.error_feedback:.4f}")
 
         time.sleep(8)
 
