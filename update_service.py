@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
+from contextlib import asynccontextmanager
 import uvicorn
 import os
-import subprocess
 import numpy as np
 import httpx
 import asyncio
@@ -14,14 +14,14 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import math
 from zoneinfo import ZoneInfo
-import json  # ← ADDED: required for save_state / load_state
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="ERM Live Update Service — V5")
+app = FastAPI(title="ERM Live Update Service — V5.1")
 
-VERSION = "5.0"
+VERSION = "5.1"
 
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
@@ -61,7 +61,6 @@ class ERM_Live_Adaptive:
         self.alpha = 0.75
 
     def save_state(self, filepath: Path):
-        """Patched: now safely converts defaultdict and uses pretty-print JSON"""
         state = {}
         for k, v in self.__dict__.items():
             if k.startswith('_'):
@@ -69,7 +68,7 @@ class ERM_Live_Adaptive:
             if isinstance(v, deque):
                 state[k] = list(v)
             elif isinstance(v, defaultdict):
-                state[k] = dict(v)          # ← fix for hourly_bias
+                state[k] = dict(v)
             else:
                 state[k] = v
         state["last_update_timestamp"] = datetime.now().isoformat()
@@ -84,7 +83,6 @@ class ERM_Live_Adaptive:
                         if isinstance(self.__dict__[k], deque):
                             self.__dict__[k].extend(v)
                         elif k == "hourly_bias":
-                            # Restore as defaultdict so code that does hourly_bias[hour] still works
                             self.hourly_bias = defaultdict(float, v)
                         else:
                             self.__dict__[k] = v
@@ -116,7 +114,6 @@ class ERM_Live_Adaptive:
         Nr = len(recent_t) * (1 + np.var(recent_t) / 10)
         Tr = max(0.6, 1 - np.std(diffs) / (np.mean(np.abs(diffs)) + 1e-6)) * (1 - np.mean(self.humidity_history) / 200)
 
-        # V5 EWMA multi-step error feedback
         recent_error = 0.0
         if self.error_history:
             ewma_alpha = 0.3
@@ -132,10 +129,9 @@ class ERM_Live_Adaptive:
 
         volatility = np.std(self.history) if len(self.history) > 1 else 0.0
 
-        # V5 volatility-adaptive gamma & alpha
         if volatility > 3.0:
-            self.alpha = 0.65   # less aggressive recursion
-            self.gamma = 0.92   # slower decay
+            self.alpha = 0.65
+            self.gamma = 0.92
             learning_rate *= 1.5
         else:
             self.alpha = 0.75
@@ -154,23 +150,22 @@ class ERM_Live_Adaptive:
 
         base = (Nr * Tr * dphi) / max(k, 1e-8)
         f_field = base * (rhoE ** 0.5) * (tauE ** 0.5)
-
-        # V5 multivariate neighbor influence
         f_field += neighbor_influence * 0.4
 
+        # ── FIXED: prevent NaN when sum_decayed is negative ──
         recursive = 0.0
         if self.Er_history:
             times = np.arange(len(self.Er_history), 0, -1, dtype=np.float32)
             decayed = np.array(self.Er_history, dtype=np.float32) * (self.gamma ** times)
-            recursive = np.sum(decayed) ** self.alpha
+            sum_decayed = np.sum(decayed)
+            if sum_decayed >= 0:
+                recursive = sum_decayed ** self.alpha
+            else:
+                recursive = - (np.abs(sum_decayed) ** self.alpha)
 
-        # V5 adaptive field_limit
         field_limit = max(50, np.std(self.history) * 3) if len(self.history) > 1 else 200
         Er_new = np.clip(f_field + (self.lambda_damp * recursive) + correction, -field_limit, field_limit)
         self.Er_history.append(Er_new)
-
-        if abs(Er_new) > field_limit * 0.8:
-            logger.warning(f"⚠️ Extreme Er_new detected for {city_name}: {abs(Er_new):.1f}")
 
         beta = np.clip(np.std(self.history) / (np.std(self.Er_history) + 1e-6),
                        max(0.01, np.std(self.history)/50),
@@ -202,31 +197,36 @@ class ERM_Live_Adaptive:
             last = float(self.Er_history[-1]) if self.Er_history else 0.0
             return {s: last for s in steps_list}
 
-# normalize_city_key, get_yesterday_baseline, fetch_multi_variable_data, backfill_realized_errors, git_backup unchanged from previous version
+# ─────────────────────────────────────────────────────────────
+#  PASTE YOUR FULL /update ENDPOINT HERE
+#  (normalize_city_key, get_yesterday_baseline, fetch_multi_variable_data,
+#   backfill_realized_errors, git_backup, etc.)
+#  Make sure backfill_realized_errors uses:
+#      pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
+# ─────────────────────────────────────────────────────────────
 
-update_lock = asyncio.Lock()
+# Example placeholder (replace with your real endpoint):
+# @app.post("/update")
+# async def update(...): ...
 
-@app.on_event("startup")
-async def startup_event():
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "V5.1 Context-Aware Relational (final)"}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=10, max_keepalive_connections=5))
     base_dir = Path(__file__).parent
     (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
     (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
-    logger.info("🚀 V5 HTTP client initialized and directories ready")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global http_client
+    logger.info("🚀 V5.1 HTTP client initialized and directories ready")
+    yield
     if http_client:
         await http_client.aclose()
-    logger.info("🛑 V5 HTTP client closed")
+    logger.info("🛑 V5.1 HTTP client closed")
 
-# /update endpoint remains the same as previous version (with refined neighbor influence and missing-data fallback already applied)
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "version": "V5 Context-Aware Relational (final)"}
+app = FastAPI(title="ERM Live Update Service — V5.1", lifespan=lifespan)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
