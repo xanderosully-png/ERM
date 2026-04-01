@@ -5,3 +5,5 @@ pandas
 plotly
 fastapi
 uvicorn
+uvicorn[standard]
+httpx
