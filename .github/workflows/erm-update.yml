@@ -2,8 +2,8 @@ name: ERM Live Update
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes — matches your Streamlit refresh
-  workflow_dispatch:         # allows manual trigger from GitHub UI
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:         # manual trigger
 
 jobs:
   update:
@@ -14,9 +14,9 @@ jobs:
         run: |
           echo "🚀 Triggering ERM recorder on Render..."
           
-          # Robust curl with retries for Render free-tier cold starts
-          curl -f --max-time 90 --retry 3 --retry-delay 5 \
-               -X GET "https://ermforecast.onrender.com/update" || \
-          echo "⚠️ Ping failed (normal on first wake-up or temporary Render hiccup)"
+          # Robust curl + capture JSON response for visibility
+          RESPONSE=$(curl -s -f --max-time 90 --retry 3 --retry-delay 5 \
+                       -X GET "https://ermforecast.onrender.com/update" || echo '{"status":"failed"}')
           
+          echo "Response: $RESPONSE"
           echo "✅ GitHub Action completed at $(date)"
