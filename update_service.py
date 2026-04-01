@@ -406,7 +406,38 @@ async def update_data(background_tasks: BackgroundTasks):
     background_tasks.add_task(git_backup, data_dir)
     return {"status": "success", "updated": len(cities), "successful": successful, "time": datetime.now().isoformat()}
 
+# ==================== NEW /LATEST ENDPOINT ====================
+@app.get("/latest")
+async def get_latest():
+    """
+    Returns the most recent row for every city from the ERM_Data CSVs.
+    This is what your Streamlit app should call instead of Open-Meteo.
+    """
+    data_dir = Path(__file__).parent / "ERM_Data"
+    latest_data = []
 
+    for csv_path in data_dir.glob("erm_v4.4_*.csv"):
+        try:
+            df = pd.read_csv(csv_path)
+            if df.empty:
+                continue
+
+            # Extract city name from filename for convenience in Streamlit
+            filename = csv_path.name
+            # erm_v4.4_columbus_oh_20250401.csv → Columbus_OH
+            city_part = filename.replace("erm_v4.4_", "").split("_20")[0]  # split before date
+            city_name = city_part.replace("_", " ").title().replace(" ", "_")
+
+            row = df.iloc[-1].to_dict()
+            row["city"] = city_name  # add city so Streamlit knows which is which
+            latest_data.append(row)
+        except Exception as e:
+            logger.warning(f"Could not read latest from {csv_path.name}: {e}")
+
+    logger.info(f"📡 /latest served {len(latest_data)} cities")
+    return latest_data
+
+# ==================== HEALTH ====================
 @app.get("/health")
 async def health():
     return {"status": "healthy", "version": "V5.4-clean Context-Aware Relational"}
