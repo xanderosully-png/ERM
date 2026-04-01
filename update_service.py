@@ -9,10 +9,11 @@ import csv
 import json
 import pandas as pd
 import logging
+import threading
 from datetime import datetime
 from collections import deque
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -77,8 +78,9 @@ class ERM_Live_Adaptive:
     def record_error(self, error: float):
         self.error_history.append(error)
 
-    def step(self, current_temp, current_humidity, current_wind, current_pressure,
-             previous_temp, hour_of_day, local_avg_temp, local_temp_range):
+    def step(self, current_temp: float, current_humidity: float, current_wind: float, current_pressure: float,
+             previous_temp: Optional[float], hour_of_day: int, local_avg_temp: float, local_temp_range: float,
+             city_name: str = "Unknown") -> Tuple[float, float, float]:
         self.history.append(current_temp)
         self.humidity_history.append(current_humidity)
         self.wind_history.append(current_wind)
@@ -132,14 +134,15 @@ class ERM_Live_Adaptive:
         self.Er_history.append(Er_new)
 
         if abs(Er_new) > field_limit * 0.8:
-            logger.warning(f"⚠️ Extreme Er_new detected: {abs(Er_new):.1f}")
+            logger.warning(f"⚠️ Extreme Er_new detected for {city_name}: {abs(Er_new):.1f}")
 
         beta = np.clip(np.std(self.history) / (np.std(self.Er_history) + 1e-6),
                        max(0.01, np.std(self.history)/50),
                        max(1.0, np.std(self.history)/2))
         beta = beta * (1 - 0.2 * error_factor)
 
-        self.bias_offset *= 0.995
+        decay_rate = 0.995 if volatility < 3.0 else 0.99
+        self.bias_offset *= decay_rate
         self.bias_offset += learning_rate * recent_error * 0.08
         bias_limit = max(2.0, np.std(self.history) * 1.5) if len(self.history) > 1 else 5.0
         self.bias_offset = np.clip(self.bias_offset, -bias_limit, bias_limit)
@@ -147,7 +150,7 @@ class ERM_Live_Adaptive:
         next_predicted = current_temp + (Er_new * beta) + self.bias_offset
         return Er_new, next_predicted, beta
 
-    def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]):
+    def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
         if len(self.Er_history) < 5:
             last = float(self.Er_history[-1]) if self.Er_history else 0.0
             return {s: last for s in steps_list}
@@ -189,21 +192,25 @@ async def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Op
             resp = await http_client.get("https://api.open-meteo.com/v1/forecast", params=params)
             resp.raise_for_status()
             data = resp.json()
-            current = data['current']
-            daily = data['daily']
+            current = data.get('current', {})
+            daily = data.get('daily', {})
+            temps_max = daily.get('temperature_2m_max', [])
+            temps_min = daily.get('temperature_2m_min', [])
             return {
-                'temp': current['temperature_2m'],
-                'humidity': current['relative_humidity_2m'],
-                'wind': current['wind_speed_10m'],
-                'pressure': current['surface_pressure'],
+                'temp': current.get('temperature_2m'),
+                'humidity': current.get('relative_humidity_2m'),
+                'wind': current.get('wind_speed_10m'),
+                'pressure': current.get('surface_pressure'),
                 'time': datetime.now().isoformat(),
-                'tomorrow_max': daily.get('temperature_2m_max', [None, None])[1],
-                'tomorrow_min': daily.get('temperature_2m_min', [None, None])[1]
+                'tomorrow_max': temps_max[1] if len(temps_max) > 1 else None,
+                'tomorrow_min': temps_min[1] if len(temps_min) > 1 else None
             }
         except Exception as e:
             logger.warning(f"Failed fetching data for {lat},{lon} (attempt {attempt+1}): {e}")
             if attempt < 2:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2 ** attempt)
+            else:
+                logger.exception(f"Final failure fetching data for {lat},{lon}")
     return None
 
 
@@ -249,11 +256,15 @@ def git_backup(data_dir: Path):
             today_str = datetime.now().strftime('%Y%m%d')
             subprocess.run(["git", "add", f"ERM_Data/*_{today_str}.csv"], cwd=repo_root, check=True, capture_output=True)
             subprocess.run(["git", "add", f"ERM_State/*"], cwd=repo_root, check=True, capture_output=True)
-            subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
-            commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], cwd=repo_root, capture_output=True, text=True)
-            if commit_result.returncode == 0:
-                subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=repo_root, check=True, capture_output=True, text=True)
-                logger.info("✅ Git backup successful")
+            diff_check = subprocess.run(["git", "diff-index", "--quiet", "HEAD", "--"], cwd=repo_root, capture_output=True)
+            if diff_check.returncode != 0:
+                subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
+                commit_result = subprocess.run(["git", "commit", "-m", f"ERM live update {datetime.now().isoformat()}"], cwd=repo_root, capture_output=True, text=True)
+                if commit_result.returncode == 0:
+                    subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=repo_root, check=True, capture_output=True, text=True)
+                    logger.info("✅ Git backup successful")
+                else:
+                    logger.info("No changes to commit")
             else:
                 logger.info("No changes to commit")
         except Exception as e:
@@ -267,8 +278,11 @@ update_lock = asyncio.Lock()
 @app.on_event("startup")
 async def startup_event():
     global http_client
-    http_client = httpx.AsyncClient(timeout=10.0)
-    logger.info("🚀 HTTP client initialized")
+    http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=10, max_keepalive_connections=5))
+    base_dir = Path(__file__).parent
+    (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
+    (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
+    logger.info("🚀 HTTP client initialized and directories ready")
 
 
 @app.on_event("shutdown")
@@ -283,11 +297,8 @@ async def shutdown_event():
 @app.head("/update")
 async def update_data(background_tasks: BackgroundTasks):
     async with update_lock:
-        base_dir = Path(__file__).parent
-        data_dir = base_dir / "ERM_Data"
-        state_dir = base_dir / "ERM_State"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        state_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = Path(__file__).parent / "ERM_Data"
+        state_dir = Path(__file__).parent / "ERM_State"
 
         cities = DEFAULT_CITIES
         erms = {}
@@ -301,73 +312,61 @@ async def update_data(background_tasks: BackgroundTasks):
         today_str = now.strftime('%Y%m%d')
         hour_of_day = now.hour
 
-        sem = asyncio.Semaphore(5)
+        sem_limit = int(os.getenv("ERM_SEMAPHORE_LIMIT", 5))
+        sem = asyncio.Semaphore(sem_limit)
 
-        async def fetch_city(city):
+        async def fetch_and_update(city):
             async with sem:
-                return city, await fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
+                data = await fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
+                if isinstance(data, Exception) or not data:
+                    logger.warning(f"Skipped {city['name']} due to fetch error")
+                    return city['name'], False
+                live_temp = data['temp']
+                erm = erms[city['name']]
+                baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
+                Er_flux, next_predicted, beta = erm.step(
+                    live_temp, data['humidity'], data['wind'], data['pressure'],
+                    erm.history[-1] if len(erm.history) > 0 else None,
+                    hour_of_day, city['local_avg_temp'], city['local_temp_range'],
+                    city_name=city['name']
+                )
+                realized_error = live_temp - next_predicted
+                erm.record_error(realized_error)
+                erm_err = abs(live_temp - next_predicted)
+                baseline_err = abs(live_temp - baseline_temp)
+                improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01) if baseline_err > 0 else 0.0
+                if improvement < -50:
+                    logger.warning(f"🚨 ANOMALY ALERT: {city['name']} improvement {improvement:.1f}% — check data/API")
+                future = erm.predict_future([1, 3, 6, 12, 24, 48])
+                row = {
+                    'timestamp': data['time'],
+                    'timestamp_utc': datetime.utcnow().isoformat(),
+                    'live_temp': live_temp,
+                    'humidity': data['humidity'], 'wind': data['wind'], 'pressure': data['pressure'],
+                    'erm_flux': Er_flux, 'beta': beta, 'baseline_temp': baseline_temp,
+                    # next_predicted already includes current Er_new * beta + bias_offset
+                    # future[h] is the additional Er delta for that horizon → correct to add
+                    **{f'next_predicted_{h}h': next_predicted + future.get(h, 0.0) for h in [1, 3, 6, 12, 24, 48]},
+                    'tomorrow_max': data.get('tomorrow_max'), 'tomorrow_min': data.get('tomorrow_min'),
+                    'improvement_pct': improvement,
+                    'error_1h': np.nan, 'error_3h': np.nan, 'error_6h': np.nan,
+                    'error_12h': np.nan, 'error_24h': np.nan, 'error_48h': np.nan
+                }
+                csv_path = data_dir / f"erm_v{VERSION}_{normalize_city_key(city['name'])}_{today_str}.csv"
+                file_exists = csv_path.exists()
+                df_row = pd.DataFrame([row])
+                df_row.to_csv(csv_path, mode='a', header=not file_exists, index=False)
+                logger.debug(f"✅ Updated {city['name']} → improvement {improvement:.1f}% | error {realized_error:.3f}")
+                state_file = state_dir / f"erm_state_{normalize_city_key(city['name'])}.json"
+                erm.save_state(state_file)
+                return city['name'], True
 
-        results = await asyncio.gather(*(fetch_city(city) for city in cities), return_exceptions=True)
-
-        for city, data in results:
-            if isinstance(data, Exception) or not data:
-                logger.warning(f"Skipped {city['name']} due to fetch error")
-                continue
-
-            live_temp = data['temp']
-            erm = erms[city['name']]
-
-            baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
-
-            Er_flux, next_predicted, beta = erm.step(
-                live_temp, data['humidity'], data['wind'], data['pressure'],
-                erm.history[-1] if len(erm.history) > 0 else None,
-                hour_of_day, city['local_avg_temp'], city['local_temp_range']
-            )
-
-            realized_error = live_temp - next_predicted
-            erm.record_error(realized_error)
-
-            erm_err = abs(live_temp - next_predicted)
-            baseline_err = abs(live_temp - baseline_temp)
-            improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01) if baseline_err > 0 else 0.0
-
-            if improvement < -50:
-                logger.warning(f"🚨 ANOMALY ALERT: {city['name']} improvement {improvement:.1f}% — check data/API")
-
-            future = erm.predict_future([1, 3, 6, 12, 24, 48])
-
-            row = {
-                'timestamp': data['time'],
-                'timestamp_utc': datetime.utcnow().isoformat(),
-                'live_temp': live_temp,
-                'humidity': data['humidity'], 'wind': data['wind'], 'pressure': data['pressure'],
-                'erm_flux': Er_flux, 'beta': beta, 'baseline_temp': baseline_temp,
-                'next_predicted_1h': next_predicted + future[1],
-                'next_predicted_3h': next_predicted + future[3],
-                'next_predicted_6h': next_predicted + future[6],
-                'next_predicted_12h': next_predicted + future[12],
-                'next_predicted_24h': next_predicted + future[24],
-                'next_predicted_48h': next_predicted + future[48],
-                'tomorrow_max': data.get('tomorrow_max'), 'tomorrow_min': data.get('tomorrow_min'),
-                'improvement_pct': improvement,
-                'error_1h': np.nan, 'error_3h': np.nan, 'error_6h': np.nan,
-                'error_12h': np.nan, 'error_24h': np.nan, 'error_48h': np.nan
-            }
-
-            csv_path = data_dir / f"erm_v{VERSION}_{normalize_city_key(city['name'])}_{today_str}.csv"
-            file_exists = csv_path.exists()
-            df_row = pd.DataFrame([row])
-            df_row.to_csv(csv_path, mode='a', header=not file_exists, index=False)
-
-            logger.info(f"✅ Updated {city['name']} → improvement {improvement:.1f}% | error {realized_error:.3f}")
-
-            state_file = state_dir / f"erm_state_{normalize_city_key(city['name'])}.json"
-            erm.save_state(state_file)
+        results = await asyncio.gather(*(fetch_and_update(city) for city in cities), return_exceptions=True)
+        successful = sum(1 for r in results if not isinstance(r, Exception) and r[1] is True)
 
     backfill_realized_errors(data_dir)
     background_tasks.add_task(git_backup, data_dir)
-    return {"status": "success", "updated": len(cities), "time": datetime.now().isoformat()}
+    return {"status": "success", "updated": len(cities), "successful": successful, "time": datetime.now().isoformat()}
 
 
 @app.get("/health")
