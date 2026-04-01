@@ -108,8 +108,13 @@ def fetch_data(lat, lon, tz):
     except Exception:
         return None
 
-@st.cache_data(ttl=300)
+def normalize_city_key(city_name: str) -> str:
+    """Make sure live city names match saved CSV keys (case-insensitive, underscores)."""
+    return city_name.lower().replace(" ", "_").replace("-", "_")
+
+@st.cache_data(ttl=600, show_spinner=False)  # 10 min cache - much better for 5-min live updates
 def load_erm_data():
+    """Load all historical ERM_Data from GitHub. Cached aggressively."""
     data_dir_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ERM_Data"
     try:
         resp = requests.get(data_dir_url)
@@ -122,19 +127,27 @@ def load_erm_data():
                 df = pd.read_csv(raw_url)
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df = df.sort_values('timestamp').drop_duplicates(subset='timestamp')
-                # Parse city name from filename: erm_v4.4_columbus_oh_20260331.csv
+
+                # Parse city name from filename
                 stem = file["name"].replace(".csv", "")
                 parts = stem.split("_")
                 city_key = "_".join(parts[2:-1]) if len(parts) > 3 else parts[2]
+                city_key = normalize_city_key(city_key)
+
                 if city_key not in city_data:
                     city_data[city_key] = []
                 city_data[city_key].append(df)
+
         for city in city_data:
-            city_data[city] = pd.concat(city_data[city], ignore_index=True).drop_duplicates(subset='timestamp').sort_values('timestamp')
+            city_data[city] = pd.concat(city_data[city], ignore_index=True)\
+                               .drop_duplicates(subset='timestamp')\
+                               .sort_values('timestamp')
         return city_data
     except Exception:
+        st.warning("Could not load ERM_Data from GitHub (rate limit or network issue). Using live mode only.")
         return {}
 
+# ====================== STREAMLIT APP ======================
 st.set_page_config(page_title=f"ERM v{VERSION} Live", page_icon="🌡️", layout="wide")
 st.title("🌍 ERM v4.4 — Live Adaptive Weather Predictor + Saved ERM_Data")
 
@@ -182,18 +195,30 @@ if mode == "Live":
             erm = st.session_state.erms_live[name]
             prev = st.session_state.previous_live.get(name)
 
-            if prev:
-                erm_err = abs(live_temp_c - prev["next_predicted"])
-                baseline_err = abs(live_temp_c - prev["live_temp"])
-                improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01)
+            # === NEW: Proper % improvement using yesterday's same-hour temp ===
+            norm_name = normalize_city_key(name)
+            if norm_name in erm_data:
+                hist = erm_data[norm_name]
+                yesterday = datetime.now() - pd.Timedelta(days=1)
+                yesterday_same_hour = hist[
+                    (hist['timestamp'].dt.date == yesterday.date()) &
+                    (hist['timestamp'].dt.hour == hour)
+                ]
+                baseline_temp = yesterday_same_hour['live_temp'].mean() if not yesterday_same_hour.empty else city["local_avg_temp"]
             else:
-                improvement = 0.0
+                baseline_temp = city["local_avg_temp"]
 
+            # Run ERM step (predictions stay separate from live data)
             Er_flux, next_predicted_c, beta = erm.step(
                 live_temp_c, data["humidity"], data["wind"], data["pressure"],
                 prev["live_temp"] if prev else None, hour,
                 city["local_avg_temp"], city["local_temp_range"]
             )
+
+            # Calculate meaningful improvement
+            erm_err = abs(live_temp_c - next_predicted_c)
+            baseline_err = abs(live_temp_c - baseline_temp)
+            improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01) if baseline_err > 0 else 0.0
 
             future = erm.predict_future()
             live_f = to_unit(live_temp_c, unit)
@@ -229,7 +254,7 @@ if mode == "Live":
             with cols[idx % len(cols)]:
                 st.error(f"❌ {name} — API unavailable")
 
-else:
+else:  # Saved ERM_Data mode
     erm_data = load_erm_data()
     if not erm_data:
         st.info("📁 No ERM_Data files found yet.\n\nThe background service is collecting live data and will create CSVs shortly.")
@@ -241,16 +266,14 @@ else:
             st.subheader(f"📊 Saved Historical Data — {selected_saved_city.replace('_', ' ')}")
             st.caption(f"Total records: {len(df):,} | Range: {df['timestamp'].min().date()} – {df['timestamp'].max().date()}")
 
-            # Main chart: Actual vs ERM Predictions (all horizons)
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df["timestamp"], y=df["live_temp"], name="Actual Temp", line=dict(color="#1f77b4", width=3)))
             for col in [c for c in df.columns if c.startswith("next_predicted_")]:
                 hours = col.split("_")[-1].replace("h", "")
                 fig.add_trace(go.Scatter(x=df["timestamp"], y=df[col], name=f"{hours}h ERM Pred", line=dict(dash="dash")))
-            fig.update_layout(title="Temperature + ERM Predictions (using full ERM formula)", height=500, xaxis_title="Time", yaxis_title="°C")
+            fig.update_layout(title="Temperature + ERM Predictions", height=500, xaxis_title="Time", yaxis_title="°C")
             st.plotly_chart(fig, use_container_width=True)
 
-            # Improvement chart
             fig_imp = go.Figure()
             fig_imp.add_trace(go.Scatter(x=df["timestamp"], y=df["improvement_pct"], name="% Improvement", line=dict(color="#2ca02c")))
             fig_imp.update_layout(title="ERM Improvement over Baseline", height=300, xaxis_title="Time", yaxis_title="%")
@@ -278,4 +301,4 @@ if mode == "Live" and auto_refresh:
         st.session_state.force_update = False
         st.rerun()
 
-st.caption("🚀 ERM v4.4 • Live + Auto-loaded GitHub ERM_Data • Last updated banner active")
+st.caption("🚀 ERM v4.4 • Live + Auto-loaded GitHub ERM_Data • % Improvement now uses yesterday's same-hour baseline")
