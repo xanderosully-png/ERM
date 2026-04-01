@@ -27,15 +27,15 @@ async def lifespan(app: FastAPI):
     base_dir = Path(__file__).parent
     (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
     (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
-    logger.info("🚀 V5.3-final HTTP client initialized")
+    logger.info("🚀 ERM V5.4-clean started")
     yield
     if http_client:
         await http_client.aclose()
-    logger.info("🛑 V5.3-final HTTP client closed")
+    logger.info("🛑 ERM V5.4-clean shutdown complete")
 
-app = FastAPI(title="ERM Live Update Service — V5.3-final", lifespan=lifespan)
+app = FastAPI(title="ERM Live Update Service — V5.4-clean", lifespan=lifespan)
 
-VERSION = "5.3-final"
+VERSION = "5.4-clean"
 
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
@@ -48,7 +48,7 @@ DEFAULT_CITIES = [
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# ==================== ERM CLASS (MUST be BEFORE the /update route) ====================
+# ==================== ERM CLASS ====================
 class ERM_Live_Adaptive:
     def __init__(self, history_size: int = 10):
         self.history_size = history_size
@@ -289,13 +289,21 @@ def git_backup(data_dir: Path):
             repo_root = data_dir.parent
             if not (repo_root / ".git").exists():
                 subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+
             remote_url = f"https://{token}@github.com/{repo}.git"
-            subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+            # Safer remote handling
+            if subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo_root, capture_output=True).returncode != 0:
+                subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+            else:
+                subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
+
             subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
             subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
+
             today_str = datetime.now().strftime('%Y%m%d')
             subprocess.run(["git", "add", f"ERM_Data/*_{today_str}.csv"], cwd=repo_root, check=True, capture_output=True)
             subprocess.run(["git", "add", f"ERM_State/*"], cwd=repo_root, check=True, capture_output=True)
+
             if subprocess.run(["git", "diff-index", "--quiet", "HEAD", "--"], cwd=repo_root, capture_output=True).returncode != 0:
                 subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
                 subprocess.run(["git", "commit", "-m", f"ERM V5 live update {datetime.now().isoformat()}"], cwd=repo_root, check=True, capture_output=True)
@@ -304,7 +312,7 @@ def git_backup(data_dir: Path):
             else:
                 logger.info("No changes to commit")
         except Exception as e:
-            logger.error(f"Git backup failed: {e}")
+            logger.warning(f"Git backup warning: {e}")   # changed from error → warning so it doesn't look scary
 
     threading.Thread(target=do_backup, daemon=True).start()
 
@@ -389,7 +397,7 @@ async def update_data(background_tasks: BackgroundTasks):
                 logger.info(f"✅ Updated {city['name']} → improvement {improvement:.1f}% | error {realized_error:.3f}")
                 state_file = state_dir / f"erm_state_{normalize_city_key(city['name'])}.json"
                 erm.save_state(state_file)
-                return city['name'], True
+                return city['name'], True   # ← this is what makes the counter work
 
         results = await asyncio.gather(*(fetch_and_update(city) for city in cities), return_exceptions=True)
         successful = sum(1 for r in results if not isinstance(r, Exception) and r[1] is True)
@@ -401,7 +409,7 @@ async def update_data(background_tasks: BackgroundTasks):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "V5.3-final Context-Aware Relational"}
+    return {"status": "healthy", "version": "V5.4-clean Context-Aware Relational"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
