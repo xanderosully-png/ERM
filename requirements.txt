@@ -1,5 +1,5 @@
 # =============================================
-# ERM v8.0 — Unified requirements.txt
+# ERM v9.1 — Unified requirements.txt
 # Covers BOTH FastAPI backend AND Streamlit dashboard
 # Install with: pip install -r requirements.txt
 # =============================================
@@ -19,6 +19,9 @@ streamlit>=1.38.0
 plotly>=5.23.0
 requests>=2.32.0
 
+# === Visualization (matplotlib for /visualize endpoint) ===
+matplotlib>=3.8.0
+
 # === Shared utilities (already covered above but explicit for clarity) ===
 # pandas, numpy already listed
 
@@ -36,7 +39,7 @@ requests>=2.32.0
 # =============================================
 # Notes:
 # • This file is intentionally minimal and version-flexible for Render + GitHub Actions.
-# • All packages used in main.py (FastAPI) and app.py (Streamlit) are included.
+# • All packages used in main.py (FastAPI + matplotlib) and app.py (Streamlit) are included.
 # • No conflicting versions — tested together with Python 3.12.
 # • Render.yaml and GitHub Actions both reference this file implicitly.
 # =============================================
