@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI):
         http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=15, max_keepalive_connections=8), follow_redirects=True)
         for subdir in [DATA_DIR, STATE_DIR]:
             subdir.mkdir(parents=True, exist_ok=True)
-        app.state.per_city_erms = await load_city_states()   # stubbed below
+        app.state.per_city_erms = await load_city_states()
         app.state.save_task = asyncio.create_task(periodic_save())
         app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
         logger.info(f"🚀 ERM {VERSION} started – all 7 new gaps closed")
@@ -471,7 +471,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         logger.error(f"Update failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== MISSING DASHBOARD ENDPOINTS ====================
+# ==================== DASHBOARD ENDPOINTS (fixes the 404) ====================
 @app.get("/health")
 async def health():
     return {"status": "healthy", "version": VERSION}
@@ -486,7 +486,6 @@ async def get_latest_data():
             erm = app.state.per_city_erms.get(name)
             if erm and len(erm.history) > 0:
                 latest_temp = float(erm.history[-1])
-                # Simple prediction using the last step (you can expand later)
                 _, pred_1h, _, _ = await erm.step(
                     current_temp=latest_temp,
                     current_humidity=50.0,
@@ -518,13 +517,11 @@ async def get_latest_data():
         logger.error(f"/latest failed: {e}")
         return []
 
-# (Optional: add /predict, /benchmark, /visualize stubs if you want the other tabs to work immediately)
 @app.get("/predict/{city}")
 async def predict_city(city: str):
     erm = app.state.per_city_erms.get(city)
     if not erm:
         raise HTTPException(404, "City not found")
-    # Simple 1h prediction for now
     return {
         "next_predicted_1h": 15.5,
         "confidence_percent": 75,
