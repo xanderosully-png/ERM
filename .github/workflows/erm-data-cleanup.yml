@@ -1,0 +1,37 @@
+name: ERM Data Cleanup
+
+on:
+  schedule:
+    - cron: '0 3 * * *'     # Every day at 3 AM UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Delete old CSVs (> 7 days)
+        run: |
+          echo "🧹 Searching for erm_v9.0_*.csv files older than 7 days..."
+          find ERM_Data -name "erm_v9.0_*.csv" -type f -mtime +7 -delete || true
+          echo "✅ Cleanup completed"
+
+      - name: Commit and push cleanup (if changes exist)
+        run: |
+          git config --global user.name "ERM Cleanup Bot"
+          git config --global user.email "erm-bot@github.com"
+          
+          git add ERM_Data/
+          
+          if git diff --cached --quiet; then
+            echo "No changes to commit - cleanup found nothing to delete."
+          else
+            git commit -m "🧹 Auto-cleanup: removed v9.0 CSVs older than 7 days"
+            git push origin main
+            echo "✅ Changes committed and pushed"
+          fi
