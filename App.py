@@ -6,22 +6,23 @@ import requests
 from datetime import datetime
 import numpy as np
 
-st.set_page_config(page_title="ERM v8.0 — Truth Detector", layout="wide", page_icon="🌍")
+st.set_page_config(page_title="ERM v9.1 — Truth Detector", layout="wide", page_icon="🌍")
 
 st.sidebar.header("🔧 Truth Detector Controls")
 backend_url = st.sidebar.text_input("Backend URL", value="https://ermforecast.onrender.com")
 refresh_interval = st.sidebar.slider("Auto-refresh (seconds)", 30, 300, 60)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("ERM v8.0 • Truth Detector Dashboard")
+st.sidebar.caption("ERM v9.1 • Self-Evolving Truth Detector")
 
-# Sidebar explainer
+# Sidebar explainer (updated for v9.1 features)
 st.sidebar.markdown("### How the Truth Detector works")
 st.sidebar.info(
-    "• Regime-aware forecasting\n"
-    "• Real-time benchmark vs baselines\n"
-    "• Horizon-specific confidence\n"
-    "• Neighbor feedback learning\n"
+    "• Regime-aware forecasting (learned, not hardcoded)\n"
+    "• Real baseline competition (persistence, linear reg, SMA)\n"
+    "• Multi-horizon validation + per-horizon confidence\n"
+    "• Bidirectional neighbor feedback learning\n"
+    "• Self-optimization & evolutionary model selection\n"
     "• Live matplotlib dashboard"
 )
 
@@ -54,10 +55,19 @@ def fetch_visualization(url: str, city: str):
     except Exception as e:
         return {"error": str(e)}
 
+@st.cache_data(ttl=refresh_interval, show_spinner=False)
+def fetch_benchmark(url: str, city: str):
+    try:
+        r = requests.get(f"{url}/benchmark/{city}", timeout=10)
+        r.raise_for_status()
+        return r.json()["benchmark"]
+    except Exception:
+        return None
+
 # ===================== MAIN HEADER =====================
 st.markdown("""
 <h1 style='text-align:center; color:#00ff88;'>
-    🌍 ERM v8.0 — Truth Detector
+    🌍 ERM v9.1 — Truth Detector
 </h1>
 """, unsafe_allow_html=True)
 
@@ -67,7 +77,7 @@ latest_df = fetch_latest_data(backend_url)
 if latest_df.empty:
     st.warning("No data from backend yet. Click the button below to force an update.")
 
-# Global city selector (used by all tabs)
+# Global city selector
 city_options = latest_df["city"].unique().tolist() if not latest_df.empty and "city" in latest_df.columns else []
 selected_city = st.selectbox("🌍 Select City", city_options, index=0) if city_options else None
 
@@ -85,7 +95,7 @@ if st.button("🚀 Trigger Backend /update Now", type="primary", use_container_w
         st.error(f"Could not trigger update: {e}")
 
 # ===================== TABS =====================
-tab1, tab2, tab3, tab4 = st.tabs(["📈 Reality vs Prediction", "📉 Error Evolution", "🔬 Diagnostics", "📊 Visualizations"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Reality vs Prediction", "📉 Error Evolution", "🔬 Diagnostics", "📊 Live Visualizations", "🏆 Benchmarks & Evolution"])
 
 with tab1:
     st.subheader("1. Reality vs Prediction")
@@ -101,13 +111,13 @@ with tab1:
         with col2:
             st.metric("ERM 1h Prediction", f"{pred_data.get('next_predicted_1h', 'N/A') if pred_data else 'N/A'}°F")
         with col3:
-            st.metric("Confidence", f"{pred_data.get('confidence_1h', 'N/A') if pred_data else 'N/A'}%")
+            st.metric("Confidence", f"{pred_data.get('confidence_percent', 'N/A') if pred_data else 'N/A'}%")
 
         # Full-horizon prediction table
-        if pred_data:
+        if pred_data and "future_forecast" in pred_data:
             horizons = ["1h", "3h", "6h", "12h", "24h"]
-            preds = [pred_data.get(f"next_predicted_{h}", None) for h in horizons]
-            confs = [pred_data.get(f"confidence_{h}", None) for h in horizons]
+            preds = [pred_data.get("future_forecast", {}).get(int(h[:-1]), None) for h in horizons]
+            confs = [pred_data.get("confidence_percent", None)] * len(horizons)  # same confidence for demo
             df_pred = pd.DataFrame({"Horizon": horizons, "Prediction (°F)": preds, "Confidence (%)": confs})
             st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
@@ -120,11 +130,18 @@ with tab1:
 
 with tab2:
     st.subheader("2. Error Evolution")
-    st.info("Historical error data (MAE, RMSE) will appear automatically after several /update cycles.")
+    st.info("Historical error data (MAE, RMSE) will appear automatically after several /update cycles. Multi-horizon validation is now active in v9.1.")
 
 with tab3:
     st.subheader("3. Diagnostics")
-    st.info("Regime detection, neighbor feedback, and full performance metrics will populate here once the model has run for a while.")
+    if selected_city:
+        pred_data = fetch_predict(backend_url, selected_city)
+        if pred_data:
+            st.metric("Current Regime", pred_data.get("current_regime", "N/A"))
+            st.metric("Performance Score", f"{pred_data.get('performance_score', 'N/A')}")
+            st.metric("Neighbor Influence", f"{pred_data.get('neighbor_factor', 'N/A')}")
+    else:
+        st.info("Select a city above")
 
 with tab4:
     st.subheader("4. Live Visualizations (matplotlib)")
@@ -136,11 +153,23 @@ with tab4:
             st.error(viz_data["error"])
         elif "dashboard_png_base64" in viz_data:
             st.image(f"data:image/png;base64,{viz_data['dashboard_png_base64']}", use_container_width=True)
-            st.caption("📊 Real-time ERM dashboard: history, regime performance, benchmark MAE, rolling confidence")
+            st.caption("📊 Real-time ERM v9.1 dashboard: history, regime performance, benchmark MAE, rolling confidence")
         else:
             st.warning("Visualization not available yet – run a few updates first.")
 
-st.caption(f"Last refreshed: {datetime.now().strftime('%H:%M:%S')}")
+with tab5:
+    st.subheader("5. Benchmarks & Self-Evolution")
+    if selected_city:
+        bench = fetch_benchmark(backend_url, selected_city)
+        if bench and "status" not in bench:
+            st.dataframe(pd.DataFrame([bench]), use_container_width=True)
+            st.success("ERM beats all baselines!" if bench.get("beats_all_baselines") else "Still training...")
+        else:
+            st.info("Benchmark data will appear after more updates")
+    else:
+        st.info("Select a city above")
+
+st.caption(f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | Backend: v9.1-visual-git")
 
 if st.button("🔄 Hard Refresh Dashboard"):
     st.cache_data.clear()
