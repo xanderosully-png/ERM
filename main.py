@@ -470,7 +470,7 @@ async def periodic_save(interval_seconds: int = 300):
             logger.error(f"Periodic save failed: {e}")
         await asyncio.sleep(interval_seconds)
 
-# ==================== HARDENED ASYNC GIT BACKUP ====================
+# ==================== IMPROVED GIT BACKUP (this fixes missing CSVs) ====================
 async def async_git_backup(data_dir: Path):
     token = os.getenv("GITHUB_TOKEN")
     repo = os.getenv("GITHUB_REPO")
@@ -479,40 +479,37 @@ async def async_git_backup(data_dir: Path):
         return
     repo_root = data_dir.parent
     try:
+        # Clean stale locks
         for lock_path in [repo_root / ".git" / "index.lock", repo_root / ".git" / "config.lock", repo_root / ".git" / "HEAD.lock"]:
             if lock_path.exists():
-                try:
-                    lock_path.unlink(missing_ok=True)
-                    logger.info(f"✅ Cleaned stale lock: {lock_path.name}")
-                except Exception as e:
-                    logger.warning(f"Could not remove lock {lock_path}: {e}")
+                lock_path.unlink(missing_ok=True)
+                logger.info(f"✅ Cleaned stale lock: {lock_path.name}")
 
-        cmds = [
-            ["git", "init"],
-            ["git", "config", "--global", "user.name", "ERM Bot"],
-            ["git", "config", "--global", "user.email", "erm-bot@github.com"],
-            ["git", "remote", "remove", "origin"],
-            ["git", "remote", "add", "origin", f"https://{token}@github.com/{repo}.git"],
-        ]
-        for cmd in cmds:
-            proc = await asyncio.create_subprocess_exec(*cmd, cwd=repo_root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            await proc.communicate()
+        # Force checkout main and set upstream
+        await asyncio.create_subprocess_exec("git", "checkout", "-B", "main", cwd=repo_root)
+        await asyncio.create_subprocess_exec("git", "branch", "--set-upstream-to=origin/main", cwd=repo_root)
 
-        await asyncio.create_subprocess_exec("git", "add", "ERM_Data/", cwd=repo_root)
-        await asyncio.create_subprocess_exec("git", "add", "ERM_State/", cwd=repo_root)
+        # Add EVERYTHING (this is the key fix)
+        await asyncio.create_subprocess_exec("git", "add", "-A", cwd=repo_root)
+        logger.info("✅ git add -A completed (ERM_Data + ERM_State)")
 
-        proc = await asyncio.create_subprocess_exec("git", "diff-index", "--quiet", "HEAD", "--", cwd=repo_root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        # Check for changes
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff-index", "--quiet", "HEAD", "--", cwd=repo_root,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
         await proc.communicate()
 
         if proc.returncode != 0:
             commit_msg = f"ERM v{VERSION} automated backup - {datetime.now().isoformat()}"
             await asyncio.create_subprocess_exec("git", "commit", "-m", commit_msg, cwd=repo_root)
-            await asyncio.create_subprocess_exec("git", "push", "-u", "origin", "main", cwd=repo_root)
-            logger.info("✅ Async git backup successful")
+            await asyncio.create_subprocess_exec("git", "push", "-u", "origin", "main", "--force-with-lease", cwd=repo_root)
+            logger.info("✅ Git commit & push successful — CSVs should now be in ERM_Data/")
         else:
-            logger.info("✅ No changes to backup")
+            logger.info("✅ No new changes to commit")
+
     except Exception as e:
-        logger.warning(f"Async git backup warning (non-critical): {e}")
+        logger.error(f"Git backup failed: {e}", exc_info=True)
 
 # ==================== PYDANTIC MODELS ====================
 class LiveWeatherRecord(BaseModel):
@@ -727,7 +724,7 @@ async def root():
         }
     }
 
-# ==================== IMPROVED /LATEST ENDPOINT (fixes 500 error) ====================
+# ==================== IMPROVED /LATEST ENDPOINT ====================
 @app.get("/latest")
 async def get_latest():
     latest_data = []
@@ -881,10 +878,9 @@ async def get_volatility_log(limit: int = 100):
 @app.head("/update")
 async def update_data(background_tasks: BackgroundTasks):
     """Lenient 5-minute update – fast response + background work"""
-    # Quick response so Render never times out
     logger.info("🚀 Received 5-min update ping – starting in background")
     
-    async with asyncio.Lock():   # prevents overlapping heavy updates
+    async with asyncio.Lock():
         try:
             fetch_tasks = {
                 city["name"]: fetch_multi_variable_data(city["lat"], city["lon"], city["tz"])
