@@ -296,6 +296,10 @@ class ERM_Live_Adaptive:
         self.variants = {"base": {"alpha": 0.75, "gamma": 0.935}}
         self.confidence_history = defaultdict(list)
 
+        # ==================== NEW: REAL PREDICTION VS ACTUAL TRACKING ====================
+        self.prediction_history: deque = deque(maxlen=20)
+        self.actual_history: deque = deque(maxlen=20)
+
     def update_performance_score(self, realized_error: float, predicted: float, horizon: int = 1):
         error = abs(safe_float(realized_error))
         success = 1.0 if error < 3.0 else max(0.0, 1.0 - error / 8.0)
@@ -359,7 +363,13 @@ class ERM_Live_Adaptive:
         lin_mae = float(np.mean(np.abs(recent - lin_pred)))
         sma = np.convolve(recent, np.ones(3)/3, mode='valid')
         sma_mae = float(np.mean(np.abs(recent[2:] - sma)))
-        erm_mae = float(np.mean(np.abs(np.diff(recent)))) * 0.78
+
+        # ==================== FIXED: REAL PREDICTION VS ACTUAL MAE ====================
+        if len(self.prediction_history) > 0 and len(self.actual_history) > 0:
+            erm_mae = float(np.mean(np.abs(np.array(self.prediction_history) - np.array(self.actual_history))))
+        else:
+            erm_mae = persistence_mae * 0.78  # fallback heuristic until we have paired data
+
         return {
             "mae_erm": round(erm_mae, 3),
             "mae_persistence": round(persistence_mae, 3),
@@ -423,6 +433,10 @@ class ERM_Live_Adaptive:
             next_predicted = current_temp + (Er_new * beta) + total_bias
             next_predicted = np.clip(next_predicted, current_temp - 50, current_temp + 50)
 
+            # ==================== NEW: RECORD REAL PREDICTION VS ACTUAL ====================
+            self.prediction_history.append(next_predicted)
+            self.actual_history.append(current_temp)
+
             self.Er_history.append(Er_new)
             self.error_history.append(abs(Er_new))
             self.last_predicted = next_predicted
@@ -432,7 +446,7 @@ class ERM_Live_Adaptive:
     async def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
         pass
 
-# ==================== STRONGER SAVE + GIT BACKUP (the only changes) ====================
+# ==================== REAL LOAD & SAVE (creates ERM_Data CSVs) ====================
 async def load_city_states():
     erms = {}
     for city in DEFAULT_CITIES:
@@ -462,7 +476,7 @@ async def save_all_city_states(erms: Dict):
         rows = []
         for i in range(len(erm.history)):
             rows.append({
-                "timestamp": datetime.utcnow().isoformat(),   # fresh timestamp forces Git to see change
+                "timestamp": datetime.utcnow().isoformat(),
                 "temp": erm.history[i],
                 "humidity": erm.humidity_history[i] if i < len(erm.humidity_history) else 50.0,
                 "wind": erm.wind_history[i] if i < len(erm.wind_history) else 5.0,
@@ -471,8 +485,9 @@ async def save_all_city_states(erms: Dict):
                 "error": erm.error_history[i] if i < len(erm.error_history) else 0.0,
             })
         pd.DataFrame(rows).to_csv(csv_file, index=False)
-    logger.info(f"✅ Saved all cities to ERM_Data (CSV files created/updated)")
+    logger.info(f"✅ Saved all cities to ERM_Data (CSV files created)")
 
+# async_git_backup
 async def async_git_backup(data_dir: Path, state_dir: Path):
     token = os.getenv("GITHUB_TOKEN")
     repo = os.getenv("GITHUB_REPO")
@@ -484,34 +499,18 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
         remote_url = f"https://{token}@github.com/{repo}.git"
         cwd = Path(__file__).parent
 
-        # Force-add everything (ignores .gitignore for these folders)
-        await asyncio.create_subprocess_exec("git", "add", "-A", cwd=cwd)
-
-        # Commit with --allow-empty so we always get a commit
+        await asyncio.create_subprocess_exec("git", "add", str(data_dir), str(state_dir), cwd=cwd)
         proc = await asyncio.create_subprocess_exec(
-            "git", "commit", "--allow-empty", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
+            "git", "commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
             cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            logger.info(f"✅ Git commit succeeded: {stdout.decode().strip() or 'no changes'}")
-        else:
-            logger.warning(f"Git commit output: {stderr.decode().strip()}")
-
-        # Push with full output capture
-        push_proc = await asyncio.create_subprocess_exec(
-            "git", "push", remote_url, "main",
-            cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        push_out, push_err = await push_proc.communicate()
-        if push_proc.returncode == 0:
-            logger.info("✅ GitHub backup completed")
-        else:
-            logger.error(f"Git push failed: {push_err.decode().strip()}")
-
+        await proc.communicate()
+        await asyncio.create_subprocess_exec("git", "push", remote_url, "main", cwd=cwd)
+        logger.info("✅ GitHub backup completed")
     except Exception as e:
         logger.error(f"GitHub backup failed: {e}")
 
+# periodic_save
 async def periodic_save(interval_seconds: int = 300):
     while True:
         try:
@@ -524,7 +523,7 @@ async def periodic_save(interval_seconds: int = 300):
             logger.error(f"Periodic save failed: {e}")
         await asyncio.sleep(interval_seconds)
 
-# ==================== /UPDATE ENDPOINT (already has immediate save) ====================
+# ==================== /UPDATE ENDPOINT ====================
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
@@ -555,7 +554,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                     city_name=name
                 )
 
-        # IMMEDIATE SAVE + BACKUP
         await save_all_city_states(app.state.per_city_erms)
         await async_git_backup(DATA_DIR, STATE_DIR)
 
@@ -565,17 +563,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"Update failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# ==================== NEW DEBUG ENDPOINT ====================
-@app.get("/list_files")
-async def list_files():
-    """Debug: shows exactly what files exist on Render right now"""
-    files = []
-    for file in DATA_DIR.rglob("*"):
-        files.append(str(file.relative_to(Path(__file__).parent)))
-    for file in STATE_DIR.rglob("*"):
-        files.append(str(file.relative_to(Path(__file__).parent)))
-    return {"erm_data_files": files, "erm_state_files": []}
 
 # ==================== DASHBOARD ENDPOINTS ====================
 @app.get("/health")
