@@ -102,6 +102,35 @@ async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
     logger.info(f"✅ Real weather data fetched for {len(data)} cities")
     return data
 
+# ==================== NEW: MISSING SATELLITE FETCH (this was the main blocker) ====================
+async def fetch_satellite_cloud_data(cities: List[Dict]) -> Dict[str, Dict]:
+    data = {}
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for city in cities:
+            name = city["name"]
+            lat = city["lat"]
+            lon = city["lon"]
+            try:
+                url = "https://api.open-meteo.com/v1/forecast"
+                params = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "cloud_cover,shortwave_radiation",
+                    "timezone": "auto",
+                }
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                current = r.json()["current"]
+                data[name] = {
+                    "cloud_cover": float(current.get("cloud_cover", 30.0)),
+                    "radiation": float(current.get("shortwave_radiation", 300.0))
+                }
+            except Exception as e:
+                logger.warning(f"Satellite data failed for {name}: {e}")
+                data[name] = {"cloud_cover": 30.0, "radiation": 300.0}
+    logger.info(f"✅ Satellite data fetched for {len(data)} cities")
+    return data
+
 # ==================== LIFESPAN ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -481,7 +510,7 @@ async def periodic_save(interval_seconds: int = 300):
             logger.error(f"Periodic save failed: {e}")
         await asyncio.sleep(interval_seconds)
 
-# ==================== /UPDATE ENDPOINT ====================
+# ==================== /UPDATE ENDPOINT (now saves immediately) ====================
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
@@ -512,7 +541,11 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                     city_name=name
                 )
 
-        logger.info("✅ Full update cycle complete (ground + satellite)")
+        # ← IMMEDIATE SAVE + BACKUP (this was missing)
+        await save_all_city_states(app.state.per_city_erms)
+        await async_git_backup(DATA_DIR, STATE_DIR)
+
+        logger.info("✅ Full update cycle complete (ground + satellite) + data saved")
         return {"status": "success", "cities_updated": len(DEFAULT_CITIES), "satellite_assimilated": True}
 
     except Exception as e:
@@ -555,8 +588,8 @@ async def get_latest_data():
             else:
                 data.append({
                     "city": name,
-                    "live_temp": 15.0,
-                    "predicted_1h": 15.5,
+                    "live_temp": None,          # changed from dummy 15.0 so we can see when data is missing
+                    "predicted_1h": None,
                     "timestamp": datetime.utcnow().isoformat()
                 })
         return data
