@@ -8,14 +8,34 @@ import numpy as np
 
 st.set_page_config(page_title="ERM v9.1 — Truth Detector", layout="wide", page_icon="🌍")
 
+# ===================== UNIT SELECTOR (new) =====================
+if "unit" not in st.session_state:
+    st.session_state.unit = "F"  # default to Fahrenheit
+
 st.sidebar.header("🔧 Truth Detector Controls")
+unit_choice = st.sidebar.radio(
+    "Temperature Unit",
+    options=["Fahrenheit (°F)", "Celsius (°C)"],
+    index=0 if st.session_state.unit == "F" else 1,
+    horizontal=True
+)
+st.session_state.unit = "F" if "F" in unit_choice else "C"
+
+def convert_temp(c: float) -> float:
+    if st.session_state.unit == "F":
+        return round((c * 9/5) + 32, 1)
+    return round(c, 1)
+
+def unit_symbol() -> str:
+    return "°F" if st.session_state.unit == "F" else "°C"
+
 backend_url = st.sidebar.text_input("Backend URL", value="https://ermforecast.onrender.com")
 refresh_interval = st.sidebar.slider("Auto-refresh (seconds)", 30, 300, 60)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("ERM v9.1 • Self-Evolving Truth Detector")
 
-# Sidebar explainer (updated for v9.1 features)
+# Sidebar explainer
 st.sidebar.markdown("### How the Truth Detector works")
 st.sidebar.info(
     "• Regime-aware forecasting (learned, not hardcoded)\n"
@@ -107,9 +127,13 @@ with tab1:
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Current Actual Temp", f"{city_data.get('live_temp', 'N/A')}°F")
+            live_c = city_data.get('live_temp', None)
+            live_display = convert_temp(live_c) if live_c is not None else "N/A"
+            st.metric("Current Actual Temp", f"{live_display}{unit_symbol()}")
         with col2:
-            st.metric("ERM 1h Prediction", f"{pred_data.get('next_predicted_1h', 'N/A') if pred_data else 'N/A'}°F")
+            pred_c = pred_data.get('next_predicted_1h', None) if pred_data else None
+            pred_display = convert_temp(pred_c) if pred_c is not None else "N/A"
+            st.metric("ERM 1h Prediction", f"{pred_display}{unit_symbol()}")
         with col3:
             st.metric("Confidence", f"{pred_data.get('confidence_percent', 'N/A') if pred_data else 'N/A'}%")
 
@@ -117,15 +141,16 @@ with tab1:
         if pred_data and "future_forecast" in pred_data:
             horizons = ["1h", "3h", "6h", "12h", "24h"]
             preds = [pred_data.get("future_forecast", {}).get(int(h[:-1]), None) for h in horizons]
+            preds_display = [convert_temp(p) if p is not None else "N/A" for p in preds]
             confs = [pred_data.get("confidence_percent", None)] * len(horizons)
-            df_pred = pd.DataFrame({"Horizon": horizons, "Prediction (°F)": preds, "Confidence (%)": confs})
+            df_pred = pd.DataFrame({"Horizon": horizons, f"Prediction ({unit_symbol()})": preds_display, "Confidence (%)": confs})
             st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
         # Simple snapshot chart
         fig = make_subplots(rows=1, cols=1)
-        fig.add_trace(go.Scatter(x=[1], y=[city_data.get('live_temp', 0)], mode='markers+text', name='Actual', text="Actual", marker=dict(color="#00ff88", size=16)))
-        fig.add_trace(go.Scatter(x=[2], y=[pred_data.get('next_predicted_1h', 0) if pred_data else 0], mode='markers+text', name='ERM', text="ERM", marker=dict(color="#ffaa00", size=16)))
-        fig.update_layout(title="Reality vs ERM Prediction", xaxis=dict(showticklabels=False), yaxis_title="Temperature (°F)")
+        fig.add_trace(go.Scatter(x=[1], y=[live_c or 0], mode='markers+text', name='Actual', text="Actual", marker=dict(color="#00ff88", size=16)))
+        fig.add_trace(go.Scatter(x=[2], y=[pred_c or 0], mode='markers+text', name='ERM', text="ERM", marker=dict(color="#ffaa00", size=16)))
+        fig.update_layout(title="Reality vs ERM Prediction", xaxis=dict(showticklabels=False), yaxis_title=f"Temperature ({unit_symbol()})")
         st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
@@ -168,7 +193,7 @@ with tab5:
     else:
         st.info("Select a city above")
 
-st.caption(f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | Backend: v9.1-visual-git")
+st.caption(f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | Backend: v9.1-visual-git | Unit: {unit_symbol()}")
 
 if st.button("🔄 Hard Refresh Dashboard"):
     st.cache_data.clear()
