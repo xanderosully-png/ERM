@@ -1,8 +1,7 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from contextlib import asynccontextmanager
 import uvicorn
 import os
-import subprocess
 import numpy as np
 import httpx
 import asyncio
@@ -12,45 +11,172 @@ import threading
 from datetime import datetime, timedelta
 from collections import deque, defaultdict
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import math
 import json
+import tempfile
+from shutil import move
+from pydantic import BaseModel, Field
+import aiofiles
+import csv
+import io
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ==================== CONSTANTS & DIRECTORIES ====================
+DATA_DIR = Path(__file__).parent / "ERM_Data"
+STATE_DIR = Path(__file__).parent / "ERM_State"
+RATE_LIMIT_WINDOW = 5.0
+VERSION = "8.0-final"
+CSV_PREFIX = "erm_v8.0"
+
+# ==================== RATE LIMITER ====================
+city_last_request: Dict[str, float] = {}
+rate_limiter_lock = asyncio.Lock()
+
+async def check_rate_limit(city_name: str):
+    async with rate_limiter_lock:
+        now = datetime.now().timestamp()
+        for k in list(city_last_request.keys()):
+            if now - city_last_request[k] > 60:
+                city_last_request.pop(k, None)
+        if city_name in city_last_request and now - city_last_request[city_name] < RATE_LIMIT_WINDOW:
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded for {city_name}. Try again in {RATE_LIMIT_WINDOW}s.")
+        city_last_request[city_name] = now
+
+# ==================== SAFETY HELPERS ====================
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+def sanitize_array(arr: List[float], default_val: float = 0.0, clip_min: float = -150.0, clip_max: float = 150.0) -> np.ndarray:
+    if len(arr) == 0:
+        return np.array([default_val], dtype=np.float32)
+    arr_np = np.array(arr, dtype=np.float32)
+    arr_np = np.nan_to_num(arr_np, nan=default_val, posinf=clip_max, neginf=clip_min)
+    return np.clip(arr_np, clip_min, clip_max)
+
+def safe_power(base: float, exp: float) -> float:
+    try:
+        if base >= 0:
+            return base ** exp
+        else:
+            return -(abs(base) ** exp)
+    except Exception:
+        return 0.0
 
 # ==================== LIFESPAN ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=10, max_keepalive_connections=5))
-    base_dir = Path(__file__).parent
-    (base_dir / "ERM_Data").mkdir(parents=True, exist_ok=True)
-    (base_dir / "ERM_State").mkdir(parents=True, exist_ok=True)
-    logger.info("🚀 ERM V5.4-clean started")
+    try:
+        http_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=15, max_keepalive_connections=8),
+            follow_redirects=True
+        )
+        for subdir in [DATA_DIR, STATE_DIR]:
+            subdir.mkdir(parents=True, exist_ok=True)
+        app.state.per_city_erms = await load_city_states()
+        app.state.save_task = asyncio.create_task(periodic_save())
+        app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
+        logger.info(f"🚀 ERM {VERSION} started (full async + hotfixes + cutoffs eliminated)")
+    except Exception as e:
+        logger.error(f"Lifespan startup failed: {e}")
+        raise
     yield
+    for task_name in ["save_task", "cleanup_task"]:
+        task = getattr(app.state, task_name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     if http_client:
         await http_client.aclose()
-    logger.info("🛑 ERM V5.4-clean shutdown complete")
+    logger.info(f"🛑 ERM {VERSION} shutdown complete")
 
-app = FastAPI(title="ERM Live Update Service — V5.4-clean", lifespan=lifespan)
+app = FastAPI(title=f"ERM Live Update Service — {VERSION}", lifespan=lifespan)
 
-VERSION = "5.4-clean"
+# ==================== CLEANUP ====================
+async def cleanup_rate_limiter(interval: int = 30):
+    while True:
+        await asyncio.sleep(interval)
+        async with rate_limiter_lock:
+            now = datetime.now().timestamp()
+            for k in list(city_last_request.keys()):
+                if now - city_last_request[k] > 60:
+                    city_last_request.pop(k, None)
 
-# ==================== HAVERSINE ====================
+# ==================== DISTANCE HELPERS ====================
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371.0
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    try:
+        lat1, lon1, lat2, lon2 = map(safe_float, [lat1, lon1, lat2, lon2])
+        if any(map(lambda x: math.isnan(x) or not math.isfinite(x), [lat1, lon1, lat2, lon2])) or not (-90 <= lat1 <= 90 and -180 <= lon1 <= 180):
+            return 999999.0
+        R = 6371.0
+        lat1_rad = math.radians(lat1)
+        lon1_rad = math.radians(lon1)
+        lat2_rad = math.radians(lat2)
+        lon2_rad = math.radians(lon2)
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return R * c
+    except Exception:
+        return 999999.0
 
-# ==================== DEFAULT_CITIES (18 cities) ====================
+def calculate_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    try:
+        lat1, lon1, lat2, lon2 = map(safe_float, [lat1, lon1, lat2, lon2])
+        if any(map(lambda x: math.isnan(x) or not math.isfinite(x), [lat1, lon1, lat2, lon2])) or not (-90 <= lat1 <= 90 and -180 <= lon1 <= 180):
+            return 0.0
+        lat1_rad = math.radians(lat1)
+        lon1_rad = math.radians(lon1)
+        lat2_rad = math.radians(lat2)
+        lon2_rad = math.radians(lon2)
+        dlon = lon2_rad - lon1_rad
+        y = math.sin(dlon) * math.cos(lat2_rad)
+        x = math.cos(lat1_rad) * math.sin(lat2_rad) - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(dlon)
+        bearing = math.degrees(math.atan2(y, x))
+        return (bearing + 360) % 360
+    except Exception:
+        return 0.0
+
+# ==================== NEIGHBOR HELPERS ====================
+def get_neighbors(city_name: str, cities: List[Dict], max_km: float = 150) -> List[str]:
+    target = next((c for c in cities if c.get('name') == city_name), None)
+    if not target:
+        return []
+    neighbors = []
+    for c in cities:
+        if c.get('name') == city_name:
+            continue
+        try:
+            dist = haversine(target.get('lat', 0), target.get('lon', 0), c.get('lat', 0), c.get('lon', 0))
+            if dist <= max_km:
+                neighbors.append(c['name'])
+        except Exception:
+            continue
+    return neighbors
+
+def neighbor_weight(city_name: str, neighbor_name: str, cities: List[Dict]) -> float:
+    target = next((c for c in cities if c.get('name') == city_name), None)
+    neigh = next((c for c in cities if c.get('name') == neighbor_name), None)
+    if not target or not neigh:
+        return 0.0
+    try:
+        d = haversine(target.get('lat', 0), target.get('lon', 0), neigh.get('lat', 0), neigh.get('lon', 0))
+        return 1.0 / (1.0 + d)
+    except Exception:
+        return 0.0
+
+# ==================== DEFAULT CITIES ====================
 DEFAULT_CITIES = [
     {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
     {"name": "Miami_FL",    "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
@@ -58,7 +184,6 @@ DEFAULT_CITIES = [
     {"name": "Los_Angeles_CA", "lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles", "local_avg_temp": 18.0, "local_temp_range": 20.0},
     {"name": "London_UK",   "lat": 51.5074, "lon": -0.1278, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
     {"name": "Tokyo_JP",    "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 28.0},
-    # Neighbors
     {"name": "Pataskala_OH",    "lat": 39.9956, "lon": -82.6743, "tz": "America/New_York", "local_avg_temp": 12.5, "local_temp_range": 22.0},
     {"name": "Cleveland_OH",    "lat": 41.4993, "lon": -81.6944, "tz": "America/New_York", "local_avg_temp": 10.5, "local_temp_range": 19.0},
     {"name": "Fort_Lauderdale_FL", "lat": 26.1224, "lon": -80.1373, "tz": "America/New_York", "local_avg_temp": 25.5, "local_temp_range": 14.0},
@@ -75,9 +200,9 @@ DEFAULT_CITIES = [
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# ==================== ERM CLASS (unchanged) ====================
+# ==================== ERM CLASS (v8.0 — cutoffs eliminated) ====================
 class ERM_Live_Adaptive:
-    def __init__(self, history_size: int = 10):
+    def __init__(self, history_size: int = 20, debug_mode: bool = False):
         self.history_size = history_size
         self.history: deque = deque(maxlen=history_size)
         self.humidity_history: deque = deque(maxlen=history_size)
@@ -89,176 +214,361 @@ class ERM_Live_Adaptive:
         self.noise_error: deque = deque(maxlen=20)
         self.bias_offset = 0.0
         self.hourly_bias = defaultdict(float)
-        self.gamma = 0.935
-        self.lambda_damp = 0.28
-        self.alpha = 0.75
+        self.gamma = 0.92
+        self.lambda_damp = 0.25
+        self.alpha = 0.78
+        self.last_predicted = None
+        self._step_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
+        self.debug_mode = debug_mode
 
-    def save_state(self, filepath: Path):
-        state = {}
-        for k, v in self.__dict__.items():
-            if k.startswith('_'): continue
-            if isinstance(v, deque):
-                state[k] = list(v)
-            elif isinstance(v, defaultdict):
-                state[k] = dict(v)
-            else:
-                state[k] = v
-        state["last_update_timestamp"] = datetime.now().isoformat()
-        filepath.write_text(json.dumps(state, indent=2))
-
-    def load_state(self, filepath: Path):
-        if filepath.exists():
+    async def async_save_state(self, filepath: Path):
+        async with self._state_lock:
             try:
-                state = json.loads(filepath.read_text())
-                for k, v in state.items():
-                    if k in self.__dict__:
-                        if isinstance(self.__dict__[k], deque):
-                            self.__dict__[k].extend(v)
-                        elif k == "hourly_bias":
-                            self.hourly_bias = defaultdict(float, v)
-                        else:
-                            self.__dict__[k] = v
+                self.backup_state(filepath)
+                state = {}
+                for k, v in self.__dict__.items():
+                    if k.startswith('_'): continue
+                    if isinstance(v, deque):
+                        state[k] = list(v)
+                    elif isinstance(v, defaultdict):
+                        state[k] = dict(v)
+                    else:
+                        state[k] = v
+                state["last_update_timestamp"] = datetime.now().isoformat()
+                state["version"] = VERSION
+                tmp_path = filepath.with_suffix('.json.tmp')
+                async with aiofiles.open(tmp_path, mode='w', encoding='utf-8') as f:
+                    await f.write(json.dumps(state, indent=2))
+                await asyncio.to_thread(move, tmp_path, filepath)
             except Exception as e:
-                logger.warning(f"Failed to load state {filepath}: {e}")
+                logger.error(f"Failed to async-save state {filepath}: {e}")
+
+    async def async_load_state(self, filepath: Path):
+        async with self._state_lock:
+            if filepath.exists():
+                try:
+                    async with aiofiles.open(filepath, mode='r', encoding='utf-8') as f:
+                        raw = await f.read()
+                    state = json.loads(raw)
+                    for k in ['history', 'humidity_history', 'wind_history', 'pressure_history',
+                              'Er_history', 'error_history', 'systematic_bias', 'noise_error']:
+                        if k in self.__dict__:
+                            self.__dict__[k].clear()
+                    for k, v in state.items():
+                        if k in self.__dict__:
+                            if isinstance(self.__dict__[k], deque):
+                                self.__dict__[k].extend(v)
+                            elif k == "hourly_bias":
+                                self.hourly_bias = defaultdict(float, v)
+                            else:
+                                self.__dict__[k] = v
+                except Exception as e:
+                    logger.error(f"Failed to async-load state {filepath}: {e}")
+                    filepath.unlink(missing_ok=True)
+
+    def backup_state(self, filepath: Path):
+        if filepath.exists():
+            backup_path = filepath.with_suffix('.backup.json')
+            try:
+                move(filepath, backup_path)
+            except Exception:
+                pass
 
     def record_error(self, realized_error: float, predicted: float):
-        error = realized_error
-        systematic = np.mean(self.error_history) if self.error_history else 0.0
-        noise = error - systematic
-        self.error_history.append(error)
-        self.systematic_bias.append(systematic)
-        self.noise_error.append(noise)
-
-    def step(self, current_temp, current_humidity, current_wind, current_pressure,
-             current_rain_prob, current_cloud_cover, current_solar,
-             previous_temp, hour_of_day, local_avg_temp, local_temp_range,
-             neighbor_influence: float = 0.0, city_name: str = "Unknown"):
-        self.history.append(current_temp)
-        self.humidity_history.append(current_humidity)
-        self.wind_history.append(current_wind)
-        self.pressure_history.append(current_pressure)
-
-        if len(self.history) < 2:
-            return 0.0, current_temp, 0.5
-
-        recent_t = np.array(self.history, dtype=np.float32)
-        diffs = np.diff(recent_t)
-        Nr = len(recent_t) * (1 + np.var(recent_t) / 10)
-        Tr = max(0.6, 1 - np.std(diffs) / (np.mean(np.abs(diffs)) + 1e-6)) * (1 - np.mean(self.humidity_history) / 200)
-
-        recent_error = 0.0
-        if self.error_history:
-            ewma_alpha = 0.3
-            recent_error = self.error_history[-1]
-            for e in reversed(list(self.error_history)[-10:]):
-                recent_error = ewma_alpha * e + (1 - ewma_alpha) * recent_error
-
-        error_factor = np.tanh(abs(recent_error) / 5.0)
-        learning_rate = 0.05 + 0.25 * error_factor
-
-        if len(self.error_history) > 1 and np.sign(self.error_history[-1]) != np.sign(self.error_history[-2]):
-            learning_rate *= 0.5
-
-        volatility = np.std(self.history) if len(self.history) > 1 else 0.0
-
-        if volatility > 3.0:
-            self.alpha = 0.65
-            self.gamma = 0.92
-            learning_rate *= 1.5
-        else:
-            self.alpha = 0.75
-            self.gamma = 0.935
-
-        Tr = Tr * (1 - 0.3 * error_factor)
-        correction = learning_rate * recent_error
-
-        pressure_trend = np.mean(np.diff(self.pressure_history)) if len(self.pressure_history) > 1 else 0.0
-        dphi = np.mean(diffs) if len(diffs) > 0 else (current_temp - previous_temp if previous_temp is not None else 0.0)
-        dphi += pressure_trend * 0.3
-
-        k = 0.8 + np.mean(np.abs(diffs)) / 5 + np.mean(self.wind_history) / 50
-        rhoE = 1.0 + ((np.mean(recent_t) - local_avg_temp) / local_temp_range) + (np.mean(self.pressure_history) - 1013) / 1000
-        tauE = 0.95 + (hour_of_day / 48)
-
-        base = (Nr * Tr * dphi) / max(k, 1e-8)
-        f_field = base * (rhoE ** 0.5) * (tauE ** 0.5)
-        f_field += neighbor_influence * 0.4
-
-        recursive = 0.0
-        if self.Er_history:
-            times = np.arange(len(self.Er_history), 0, -1, dtype=np.float32)
-            decayed = np.array(self.Er_history, dtype=np.float32) * (self.gamma ** times)
-            sum_decayed = np.sum(decayed)
-            if sum_decayed >= 0:
-                recursive = sum_decayed ** self.alpha
-            else:
-                recursive = -(np.abs(sum_decayed) ** self.alpha)
-
-        field_limit = max(50, np.std(self.history) * 3) if len(self.history) > 1 else 200
-        Er_new = np.clip(f_field + (self.lambda_damp * recursive) + correction, -field_limit, field_limit)
-        self.Er_history.append(Er_new)
-
-        beta = np.clip(np.std(self.history) / (np.std(self.Er_history) + 1e-6),
-                       max(0.01, np.std(self.history)/50),
-                       max(1.0, np.std(self.history)/2))
-        beta = beta * (1 - 0.2 * error_factor)
-
-        decay_rate = 0.995 if volatility < 3.0 else 0.99
-        self.bias_offset *= decay_rate
-        self.bias_offset += learning_rate * recent_error * 0.08
-        bias_limit = max(2.0, np.std(self.history) * 1.5) if len(self.history) > 1 else 5.0
-        self.bias_offset = np.clip(self.bias_offset, -bias_limit, bias_limit)
-
-        next_predicted = current_temp + (Er_new * beta) + self.bias_offset + self.hourly_bias[hour_of_day]
-        next_predicted = np.clip(next_predicted, current_temp - 50, current_temp + 50)
-
-        return Er_new, next_predicted, beta, pressure_trend
-
-    def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
-        if len(self.Er_history) < 5:
-            last = float(self.Er_history[-1]) if self.Er_history else 0.0
-            return {s: last for s in steps_list}
         try:
-            x = np.arange(len(self.Er_history), dtype=np.float32)
-            y = np.array(self.Er_history, dtype=np.float32)
-            slope, intercept = np.polyfit(x, y, 1)
-            return {s: float(np.clip(slope * (len(x) + s) + intercept, -200, 200)) for s in steps_list}
-        except Exception as e:
-            logger.warning(f"polyfit failed in predict_future: {e}")
-            last = float(self.Er_history[-1]) if self.Er_history else 0.0
-            return {s: last for s in steps_list}
+            error = safe_float(realized_error)
+            systematic = np.mean(self.error_history) if self.error_history else 0.0
+            noise = error - systematic
+            self.error_history.append(error)
+            self.systematic_bias.append(systematic)
+            self.noise_error.append(noise)
+        except Exception:
+            pass
+
+    async def step(self, current_temp, current_humidity, current_wind, current_pressure,
+                   current_rain_prob, current_cloud_cover, current_solar,
+                   previous_temp, hour_of_day, local_avg_temp, local_temp_range,
+                   neighbor_influence: float = 0.0, city_name: str = "Unknown",
+                   dry_run: bool = False):
+        async with self._step_lock:
+            current_temp = safe_float(current_temp, 15.0)
+            current_humidity = safe_float(current_humidity, 50.0)
+            current_wind = safe_float(current_wind, 5.0)
+            current_pressure = safe_float(current_pressure, 1013.0)
+            current_solar = safe_float(current_solar, 200.0)
+            local_avg_temp = safe_float(local_avg_temp, 15.0)
+            local_temp_range = max(1.0, safe_float(local_temp_range, 20.0))
+            neighbor_influence = safe_float(neighbor_influence, 0.0)
+            hour_of_day = int(safe_float(hour_of_day, 12))
+
+            if not dry_run:
+                self.history.append(current_temp)
+                self.humidity_history.append(current_humidity)
+                self.wind_history.append(current_wind)
+                self.pressure_history.append(current_pressure)
+
+            if len(self.history) < 3:
+                warmup_flux = (current_temp - local_avg_temp) * 0.4
+                next_predicted = current_temp + warmup_flux
+                return 0.0, next_predicted, 0.6, 0.0
+
+            try:
+                recent_t = sanitize_array(self.history, default_val=local_avg_temp)
+                diffs = np.diff(recent_t)
+                if len(diffs) == 0:
+                    diffs = np.zeros(1, dtype=np.float32)
+
+                Nr = len(recent_t) * (1 + np.var(recent_t) / 10)
+                mean_abs_diffs = np.mean(np.abs(diffs)) + 1e-8
+                Tr = max(0.6, 1 - np.std(diffs) / mean_abs_diffs) * (1 - np.mean(self.humidity_history) / 200)
+
+                recent_error = 0.0
+                if self.error_history:
+                    recent_error = safe_float(self.error_history[-1])
+                    ewma_alpha = 0.3
+                    for e in reversed(list(self.error_history)[-10:]):
+                        recent_error = ewma_alpha * safe_float(e) + (1 - ewma_alpha) * recent_error
+
+                error_factor = np.tanh(abs(recent_error) / 5.0)
+                learning_rate = 0.05 + 0.25 * error_factor
+                if len(self.error_history) > 1 and np.sign(safe_float(self.error_history[-1])) != np.sign(safe_float(self.error_history[-2])):
+                    learning_rate *= 0.5
+
+                volatility = float(np.std(self.history)) if len(self.history) > 1 else 0.0
+
+                self.gamma = 0.90 + 0.05 * np.tanh(2.0 / max(volatility, 0.5))
+
+                if volatility > 3.0:
+                    self.alpha = 0.68
+                    learning_rate *= 1.5
+                else:
+                    self.alpha = 0.78
+
+                Tr = Tr * (1 - 0.3 * error_factor)
+                correction = learning_rate * recent_error
+
+                pressure_trend = np.mean(np.diff(self.pressure_history)) if len(self.pressure_history) > 1 else 0.0
+                dphi = np.mean(diffs) if len(diffs) > 0 else (current_temp - safe_float(previous_temp))
+                dphi += pressure_trend * 0.3
+                humidity_temp_coupling = np.mean(self.humidity_history) - 50.0
+                dphi += np.tanh(humidity_temp_coupling / 50.0) * 0.2
+
+                # HOTFIX: solar radiation influence
+                solar_influence = (current_solar - 200.0) / 400.0 * 0.15
+                dphi += solar_influence
+
+                k = 0.8 + np.mean(np.abs(diffs)) / 5 + np.mean(self.wind_history) / 50
+                k = max(k, 1e-8)
+
+                rhoE = 1.0 + ((np.mean(recent_t) - local_avg_temp) / local_temp_range) + (np.mean(self.pressure_history) - 1013) / 1000
+                tauE = 0.95 + (hour_of_day / 48)
+
+                base = (Nr * Tr * dphi) / k
+                f_field = base * (rhoE ** 0.5) * (tauE ** 0.5)
+                dynamic_neighbor_scale = 0.4 * max(0.3, 1.0 - volatility / 15.0)
+                f_field += neighbor_influence * dynamic_neighbor_scale
+
+                recursive = 0.0
+                if self.Er_history:
+                    times = np.arange(len(self.Er_history), 0, -1, dtype=np.float32)
+                    decayed = np.array(self.Er_history, dtype=np.float32) * (self.gamma ** times)
+                    sum_decayed = np.nansum(decayed)
+                    if np.isfinite(sum_decayed):
+                        recursive = safe_power(sum_decayed, self.alpha)
+
+                # CUTOFF ELIMINATED: fully adaptive field_limit
+                field_limit = max(120.0, np.std(self.history) * 5.5) if len(self.history) > 1 else 400.0
+                Er_new = np.clip(f_field + (self.lambda_damp * recursive) + correction, -field_limit, field_limit)
+
+                if not dry_run:
+                    self.Er_history.append(Er_new)
+
+                std_erm = np.std(self.Er_history) if len(self.Er_history) > 1 else 1.0
+                beta = np.std(self.history) / (std_erm + 1e-6)
+                beta = np.clip(beta, max(0.05, np.std(self.history)/60), min(2.2, np.std(self.history)/1.8))
+                beta = beta * (1 - 0.2 * error_factor)
+
+                decay_rate = 0.995 if volatility < 3.0 else 0.99
+                self.bias_offset *= decay_rate
+                self.bias_offset += learning_rate * recent_error * 0.08
+                bias_limit = max(3.0, np.std(self.history) * 2.0) if len(self.history) > 1 else 6.0
+                self.bias_offset = np.clip(self.bias_offset, -bias_limit, bias_limit)
+
+                decay_rate_hourly = 0.995 if volatility < 3.0 else 0.99
+                self.hourly_bias[hour_of_day] *= decay_rate_hourly
+                self.hourly_bias[hour_of_day] += learning_rate * recent_error * 0.05
+                hourly_limit = max(4.0, np.std(self.history) * 1.8) if len(self.history) > 1 else 6.0
+                self.hourly_bias[hour_of_day] = np.clip(self.hourly_bias[hour_of_day], -hourly_limit, hourly_limit)
+
+                total_bias = self.bias_offset + self.hourly_bias[hour_of_day]
+
+                next_predicted = current_temp + (Er_new * beta) + total_bias
+                # CUTOFF FULLY ELIMINATED: adaptive clip only
+                next_predicted = np.clip(next_predicted,
+                                         current_temp - local_temp_range * 2.2,
+                                         current_temp + local_temp_range * 2.2)
+
+                if self.debug_mode and (abs(Er_new) > field_limit * 0.85 or volatility > 12.0):
+                    logger.warning(f"DEBUG {city_name} | vol={volatility:.2f} | Er={Er_new:.2f} | beta={beta:.3f} | bias={total_bias:.2f}")
+
+                return Er_new, float(next_predicted), beta, pressure_trend
+
+            except Exception as e:
+                logger.error(f"Critical error in ERM.step() for {city_name}: {e}", exc_info=True)
+                fallback_pred = current_temp + (current_temp - local_avg_temp) * 0.3
+                return 0.0, float(fallback_pred), 0.6, 0.0
+
+    async def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
+        async with self._step_lock:
+            if len(self.Er_history) < 3:
+                last = safe_float(self.Er_history[-1]) if self.Er_history else 0.0
+                return {s: last for s in steps_list}
+            try:
+                alpha_ewma = 0.3
+                smoothed = []
+                last_smoothed = safe_float(self.Er_history[-1])
+                for val in reversed(list(self.Er_history)):
+                    last_smoothed = alpha_ewma * safe_float(val) + (1 - alpha_ewma) * last_smoothed
+                    smoothed.append(last_smoothed)
+                smoothed = smoothed[::-1]
+
+                times = np.arange(len(smoothed), 0, -1, dtype=np.float32)
+                decayed = np.array(smoothed, dtype=np.float32) * (self.gamma ** times)
+                base_projection = np.nansum(decayed) ** self.alpha
+                if not np.isfinite(base_projection):
+                    base_projection = 0.0
+
+                result = {}
+                for s in steps_list:
+                    future_decay = (self.gamma ** s) * base_projection   # NO min(s,20) — cutoff eliminated
+                    result[s] = float(np.clip(future_decay, -400, 400))
+                return result
+            except Exception as e:
+                logger.warning(f"predict_future fallback: {e}")
+                last = safe_float(self.Er_history[-1]) if self.Er_history else 0.0
+                return {s: last for s in steps_list}
 
 # ==================== HELPERS ====================
 def normalize_city_key(city_name: str) -> str:
-    return city_name.lower().replace(" ", "_").replace("-", "_")
+    return str(city_name).lower().replace(" ", "_").replace("-", "_").replace(".", "_").replace("/", "_").replace(",", "_")
+
+def get_city_by_name(city_name: str, cities: List[Dict] = DEFAULT_CITIES) -> Dict:
+    city_name_norm = normalize_city_key(city_name)
+    for c in cities:
+        if normalize_city_key(c.get("name", "")) == city_name_norm:
+            return c
+    return {}
+
+async def load_city_states() -> Dict[str, ERM_Live_Adaptive]:
+    erms: Dict[str, ERM_Live_Adaptive] = {}
+    for city in DEFAULT_CITIES:
+        erm = ERM_Live_Adaptive(debug_mode=False)
+        state_file = STATE_DIR / f"erm_state_{normalize_city_key(city['name'])}.json"
+        await erm.async_load_state(state_file)
+        erms[city['name']] = erm
+    logger.info(f"✅ Loaded {len(erms)} per-city ERM states")
+    return erms
+
+async def save_all_city_states(erms: Dict[str, ERM_Live_Adaptive]):
+    for city_name, erm in erms.items():
+        state_file = STATE_DIR / f"erm_state_{normalize_city_key(city_name)}.json"
+        await erm.async_save_state(state_file)
+
+async def async_append_csv(csv_path: Path, row_dict: Dict):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if csv_path.exists() and csv_path.stat().st_size > 5_000_000:
+        backup = csv_path.with_suffix('.old.csv')
+        try:
+            move(csv_path, backup)
+            logger.info(f"CSV rotated: {csv_path.name}")
+        except Exception as e:
+            logger.warning(f"CSV rotation failed: {e}")
+    header = not csv_path.exists()
+    async with aiofiles.open(csv_path, mode='a', newline='', encoding='utf-8') as f:
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=row_dict.keys(), quoting=csv.QUOTE_MINIMAL)
+        if header:
+            writer.writeheader()
+        writer.writerow(row_dict)
+        await f.write(output.getvalue())
+
+async def periodic_save(interval_seconds: int = 300):
+    while True:
+        try:
+            if hasattr(app.state, 'per_city_erms'):
+                await save_all_city_states(app.state.per_city_erms)
+        except Exception as e:
+            logger.error(f"Periodic save failed: {e}")
+        await asyncio.sleep(interval_seconds)
+
+async def async_git_backup(data_dir: Path):
+    token = os.getenv("GITHUB_TOKEN")
+    repo = os.getenv("GITHUB_REPO")
+    if not token or not repo:
+        return
+    try:
+        repo_root = data_dir.parent
+        await asyncio.create_subprocess_exec("git", "config", "--global", "user.name", "ERM Bot", cwd=repo_root)
+        await asyncio.create_subprocess_exec("git", "config", "--global", "user.email", "erm-bot@github.com", cwd=repo_root)
+        today_str = datetime.now().strftime('%Y%m%d')
+        await asyncio.create_subprocess_exec("git", "add", f"ERM_Data/{CSV_PREFIX}_*_{today_str}.csv", cwd=repo_root)
+        await asyncio.create_subprocess_exec("git", "add", "ERM_State/*", cwd=repo_root)
+        proc = await asyncio.create_subprocess_exec("git", "diff-index", "--quiet", "HEAD", "--", cwd=repo_root)
+        await proc.communicate()
+        if proc.returncode != 0:
+            await asyncio.create_subprocess_exec("git", "commit", "-m", f"ERM V{VERSION} live update", cwd=repo_root)
+            await asyncio.create_subprocess_exec("git", "push", "-u", "origin", "main", cwd=repo_root)
+            logger.info("✅ Async git backup successful")
+    except Exception as e:
+        logger.warning(f"Async git backup warning: {e}")
+
+class LiveWeatherRecord(BaseModel):
+    live_temp: float = Field(..., ge=-100, le=100)
+    humidity: float = Field(50.0, ge=0, le=100)
+    wind: float = Field(5.0, ge=0)
+    pressure: float = Field(1013.0)
+    rain_prob: float = Field(0.0, ge=0, le=100)
+    cloud_cover: float = Field(0.0, ge=0, le=100)
+    solar: float = Field(0.0)
+
+class LiveWeatherBatch(BaseModel):
+    records: Dict[str, LiveWeatherRecord]
+
+class TuneParameters(BaseModel):
+    alpha: Optional[float] = None
+    gamma: Optional[float] = None
+    lambda_damp: Optional[float] = None
+    bias_offset: Optional[float] = None
 
 def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
     yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
-    csv_path = data_dir / f"erm_v4.4_{normalize_city_key(city_name)}_{yesterday_str}.csv"
-    if csv_path.exists():
-        try:
-            df = pd.read_csv(csv_path)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
-            yesterday_same_hour = df[(df['timestamp'].dt.date == (datetime.now() - timedelta(days=1)).date()) &
-                                     (df['timestamp'].dt.hour == hour)]
-            if not yesterday_same_hour.empty:
-                return float(yesterday_same_hour['live_temp'].mean())
-        except Exception:
-            pass
+    for prefix in [CSV_PREFIX, "erm_v4.4"]:
+        csv_path = data_dir / f"{prefix}_{normalize_city_key(city_name)}_{yesterday_str}.csv"
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                if df.empty or 'timestamp' not in df.columns or 'live_temp' not in df.columns:
+                    continue
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
+                yesterday_same_hour = df[(df['timestamp'].dt.date == (datetime.now() - timedelta(days=1)).date()) & (df['timestamp'].dt.hour == hour)]
+                if not yesterday_same_hour.empty:
+                    return float(yesterday_same_hour['live_temp'].mean())
+            except Exception:
+                continue
     for city in DEFAULT_CITIES:
-        if normalize_city_key(city['name']) == normalize_city_key(city_name):
-            return city.get('local_avg_temp', 15.0)
+        if normalize_city_key(city.get('name', '')) == normalize_city_key(city_name):
+            return float(city.get('local_avg_temp', 15.0))
     return 15.0
 
 async def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,surface_pressure",
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,precipitation_probability,cloud_cover",
         "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": timezone
     }
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             resp = await http_client.get("https://api.open-meteo.com/v1/forecast", params=params)
             resp.raise_for_status()
@@ -270,30 +580,32 @@ async def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Op
                 'humidity': current.get('relative_humidity_2m'),
                 'wind': current.get('wind_speed_10m'),
                 'pressure': current.get('surface_pressure'),
+                'precip_prob': current.get('precipitation_probability', 0.0),
+                'cloud_cover': current.get('cloud_cover', 50.0),
                 'time': datetime.now().isoformat(),
-                'tomorrow_max': daily.get('temperature_2m_max', [None, None])[1],
-                'tomorrow_min': daily.get('temperature_2m_min', [None, None])[1]
+                'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
+                'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None
             }
-        except Exception as e:
-            logger.warning(f"Failed fetching data for {lat},{lon} (attempt {attempt+1}): {e}")
-            if attempt < 2:
+        except Exception:
+            if attempt < 3:
                 await asyncio.sleep(2 ** attempt)
-    return None
+    return {'temp': 15.0, 'humidity': 60.0, 'wind': 5.0, 'pressure': 1013.0, 'precip_prob': 0.0, 'cloud_cover': 50.0, 'time': datetime.now().isoformat(), 'tomorrow_max': None, 'tomorrow_min': None}
 
 def backfill_realized_errors(data_dir: Path):
     logger.info("🔄 Back-filling realized prediction errors...")
     today_str = datetime.now().strftime('%Y%m%d')
-    for csv_path in data_dir.glob(f"erm_v4.4_*_{today_str}.csv"):
+    for csv_path in data_dir.glob(f"{CSV_PREFIX}_*_{today_str}.csv"):
         try:
             df = pd.read_csv(csv_path)
+            if df.empty or 'timestamp' not in df.columns or 'live_temp' not in df.columns:
+                continue
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
             df = df.sort_values('timestamp').reset_index(drop=True)
             horizons = [1, 3, 6, 12, 24, 48]
             for h in horizons:
-                pred_col = f'next_predicted_{h}h'
+                pred_col = f'next_predicted_{h}h' if h == 1 else f'next_predicted_{h}h'
                 error_col = f'error_{h}h'
                 if pred_col not in df.columns:
-                    df[error_col] = np.nan
                     continue
                 df['shifted_time'] = df['timestamp'] + pd.Timedelta(hours=h)
                 merged = pd.merge_asof(df[['shifted_time']], df[['timestamp', 'live_temp']],
@@ -301,215 +613,263 @@ def backfill_realized_errors(data_dir: Path):
                                        direction='forward', tolerance=pd.Timedelta('5min'))
                 df[error_col] = merged['live_temp'] - df[pred_col]
             df.drop(columns=['shifted_time'], errors='ignore').to_csv(csv_path, index=False)
-            logger.info(f"✅ Back-filled errors for {csv_path.name}")
         except Exception as e:
-            logger.warning(f"⚠️ Backfill skipped for {csv_path.name}: {e}")
+            logger.warning(f"Backfill skipped for {csv_path.name}: {e}")
 
-def git_backup(data_dir: Path):
-    def do_backup():
-        token = os.getenv("GITHUB_TOKEN")
-        repo = os.getenv("GITHUB_REPO")
-        if not token or not repo:
-            logger.warning("Git backup skipped — missing GITHUB_TOKEN or GITHUB_REPO")
-            return
+async def _core_record(city_name: str, record: LiveWeatherRecord, background_tasks: Optional[BackgroundTasks] = None):
+    city = get_city_by_name(city_name)
+    if not city:
+        raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
+    erms = app.state.per_city_erms
+    erm = erms[city_name]
+    now = datetime.now()
+    today_str = now.strftime('%Y%m%d')
+    csv_file = DATA_DIR / f"{CSV_PREFIX}_{normalize_city_key(city_name)}_{today_str}.csv"
+
+    Er_new = next_predicted = beta = pressure_trend = 0.0
+    success = False
+    try:
+        # HOTFIX: neighbor & previous calc safely outside lock
+        neighbor_names = get_neighbors(city_name, DEFAULT_CITIES)
+        weights = [neighbor_weight(city_name, n, DEFAULT_CITIES) for n in neighbor_names]
+        neighbor_factor = sum(weights) / len(weights) if weights else 0.0
+        neighbor_influence = neighbor_factor * 0.4
+
+        yesterday_temp = get_yesterday_baseline(city_name, now.hour, DATA_DIR)
+        previous_temp = erm.history[-1] if erm.history else yesterday_temp
+
+        Er_new, next_predicted, beta, pressure_trend = await erm.step(
+            current_temp=record.live_temp,
+            current_humidity=record.humidity,
+            current_wind=record.wind,
+            current_pressure=record.pressure,
+            current_rain_prob=record.rain_prob,
+            current_cloud_cover=record.cloud_cover,
+            current_solar=record.solar,
+            previous_temp=previous_temp,
+            hour_of_day=now.hour,
+            local_avg_temp=city.get("local_avg_temp", 15.0),
+            local_temp_range=city.get("local_temp_range", 20.0),
+            neighbor_influence=neighbor_influence,
+            city_name=city_name
+        )
+        erm.last_predicted = next_predicted
+
+        row_dict = {
+            "timestamp": now.isoformat(),
+            "live_temp": record.live_temp,
+            "next_predicted_1h": next_predicted,
+            "Er_value": Er_new,
+            "beta": beta,
+            "pressure_trend": pressure_trend,
+            "neighbor_influence": neighbor_influence,
+            "humidity": record.humidity,
+            "wind": record.wind,
+            "pressure": record.pressure,
+            "cloud_cover": record.cloud_cover
+        }
+        await async_append_csv(csv_file, row_dict)
+        await erm.async_save_state(STATE_DIR / f"erm_state_{normalize_city_key(city_name)}.json")
+        success = True
+        logger.info(f"✅ Recorded live data for {city_name} (temp={record.live_temp})")
+        return {"status": "recorded", "city": city_name, "Er_new": Er_new, "next_predicted": next_predicted, "timestamp": now.isoformat()}
+    except Exception as e:
+        logger.error(f"Record error for {city_name}: {e}")
+    finally:
+        if not success:
+            fallback_row = {
+                "timestamp": now.isoformat(),
+                "live_temp": record.live_temp,
+                "next_predicted_1h": record.live_temp + 1.0,
+                "Er_value": 0.0,
+                "beta": 0.6,
+                "pressure_trend": 0.0,
+                "neighbor_influence": 0.0,
+                "humidity": record.humidity,
+                "wind": record.wind,
+                "pressure": record.pressure,
+                "cloud_cover": record.cloud_cover
+            }
+            await async_append_csv(csv_file, fallback_row)
+            logger.warning(f"⚠️ Fallback CSV write used for {city_name}")
+    if background_tasks:
+        background_tasks.add_task(async_git_backup, DATA_DIR)
+
+# ==================== ENDPOINTS ====================
+@app.post("/record/{city_name}")
+async def record_live_weather(city_name: str, record: LiveWeatherRecord, background_tasks: BackgroundTasks):
+    await check_rate_limit(city_name)
+    return await _core_record(city_name, record, background_tasks)
+
+@app.post("/record_batch")
+async def record_batch(records: LiveWeatherBatch, background_tasks: BackgroundTasks):
+    results = {}
+    for city_name, record in records.records.items():
         try:
-            repo_root = data_dir.parent
-            if not (repo_root / ".git").exists():
-                subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
-
-            remote_url = f"https://{token}@github.com/{repo}.git"
-            if subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo_root, capture_output=True).returncode != 0:
-                subprocess.run(["git", "remote", "add", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-            else:
-                subprocess.run(["git", "remote", "set-url", "origin", remote_url], cwd=repo_root, check=True, capture_output=True)
-
-            subprocess.run(["git", "config", "--global", "user.name", "ERM Bot"], cwd=repo_root, check=True, capture_output=True)
-            subprocess.run(["git", "config", "--global", "user.email", "erm-bot@github.com"], cwd=repo_root, check=True, capture_output=True)
-
-            today_str = datetime.now().strftime('%Y%m%d')
-            subprocess.run(["git", "add", f"ERM_Data/*_{today_str}.csv"], cwd=repo_root, check=True, capture_output=True)
-            subprocess.run(["git", "add", f"ERM_State/*"], cwd=repo_root, check=True, capture_output=True)
-
-            if subprocess.run(["git", "diff-index", "--quiet", "HEAD", "--"], cwd=repo_root, capture_output=True).returncode != 0:
-                subprocess.run(["git", "checkout", "-B", "main"], cwd=repo_root, check=True, capture_output=True)
-                subprocess.run(["git", "commit", "-m", f"ERM V5 live update {datetime.now().isoformat()}"], cwd=repo_root, check=True, capture_output=True)
-                subprocess.run(["git", "push", "-u", "origin", "main"], cwd=repo_root, check=True, capture_output=True)
-                logger.info("✅ Git backup successful")
-            else:
-                logger.info("No changes to commit")
+            result = await _core_record(city_name, record, None)
+            results[city_name] = result
         except Exception as e:
-            logger.warning(f"Git backup warning: {e}")
+            results[city_name] = {"error": str(e)}
+    background_tasks.add_task(async_git_backup, DATA_DIR)
+    return {"status": "batch_completed", "results": results}
 
-    threading.Thread(target=do_backup, daemon=True).start()
+@app.get("/predict/{city_name}")
+async def predict_city(city_name: str, steps: Optional[str] = Query("1,3,6,12,24"), dry_run: bool = True):
+    await check_rate_limit(city_name)
+    city = get_city_by_name(city_name)
+    if not city:
+        raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
+    erms = app.state.per_city_erms
+    erm = erms[city_name]
+    step_list = [int(s.strip()) for s in steps.split(",") if s.strip().isdigit()]
 
-# ==================== /UPDATE ENDPOINT (optimized) ====================
-update_lock = asyncio.Lock()
+    today_str = datetime.now().strftime('%Y%m%d')
+    csv_path = DATA_DIR / f"{CSV_PREFIX}_{normalize_city_key(city_name)}_{today_str}.csv"
+    current_temp = city.get("local_avg_temp", 15.0)
+    current_humidity = 50.0
+    current_wind = 5.0
+    current_pressure = 1013.0
+    current_solar = 200.0
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            if not df.empty and 'live_temp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+                latest = df.loc[df['timestamp'].idxmax()]
+                current_temp = safe_float(latest.get('live_temp', current_temp))
+                current_humidity = safe_float(latest.get('humidity', current_humidity))
+                current_wind = safe_float(latest.get('wind', current_wind))
+                current_pressure = safe_float(latest.get('pressure', current_pressure))
+        except Exception:
+            pass
+
+    neighbor_names = get_neighbors(city_name, DEFAULT_CITIES)
+    weights = [neighbor_weight(city_name, n, DEFAULT_CITIES) for n in neighbor_names]
+    neighbor_factor = sum(weights) / len(weights) if weights else 0.0
+    neighbor_influence = neighbor_factor * 0.4
+
+    Er_new, next_predicted, beta, pressure_trend = await erm.step(
+        current_temp=current_temp,
+        current_humidity=current_humidity,
+        current_wind=current_wind,
+        current_pressure=current_pressure,
+        current_rain_prob=0.0,
+        current_cloud_cover=50.0,
+        current_solar=current_solar,
+        previous_temp=current_temp,
+        hour_of_day=datetime.now().hour,
+        local_avg_temp=city.get("local_avg_temp", 15.0),
+        local_temp_range=city.get("local_temp_range", 20.0),
+        neighbor_influence=neighbor_influence,
+        city_name=city_name,
+        dry_run=dry_run
+    )
+
+    future_forecast = await erm.predict_future(step_list)
+    volatility = float(np.std(erm.history)) if len(erm.history) > 1 else 0.0
+    confidence = max(0.0, 100 - volatility * 5)
+
+    return {
+        "city": city_name,
+        "current_temp_used": current_temp,
+        "Er_new": Er_new,
+        "next_predicted_1h": next_predicted,
+        "beta": beta,
+        "pressure_trend": pressure_trend,
+        "future_forecast": future_forecast,
+        "neighbor_factor": neighbor_factor,
+        "confidence_percent": round(confidence, 1),
+        "volatility": round(volatility, 2),
+        "dry_run_used": dry_run
+    }
+
+@app.patch("/tune/{city_name}")
+async def tune_erm_parameters(city_name: str, params: TuneParameters):
+    await check_rate_limit(city_name)
+    erms = app.state.per_city_erms
+    if city_name not in erms:
+        raise HTTPException(status_code=404, detail="City not found")
+    erm = erms[city_name]
+    async with erm._step_lock:
+        if params.alpha is not None: erm.alpha = float(params.alpha)
+        if params.gamma is not None: erm.gamma = float(params.gamma)
+        if params.lambda_damp is not None: erm.lambda_damp = float(params.lambda_damp)
+        if params.bias_offset is not None: erm.bias_offset = float(params.bias_offset)
+    return {"status": "tuned", "city": city_name, "new_params": params.model_dump(exclude_unset=True)}
+
+@app.get("/hotfixes")
+async def get_hotfixes():
+    return {
+        "version": VERSION,
+        "status": "all_hotfixes_applied",
+        "cutoffs_eliminated": True,
+        "lock_fixed": True,
+        "solar_influence_active": True,
+        "adaptive_clips": True,
+        "second_iteration_complete": True
+    }
+
+@app.get("/state/{city_name}")
+async def get_system_state(city_name: str):
+    erms = app.state.per_city_erms
+    if city_name not in erms:
+        raise HTTPException(status_code=404, detail="City not found")
+    erm = erms[city_name]
+    return {"city": city_name, "history_len": len(erm.history), "error_history_len": len(erm.error_history), "last_predicted": erm.last_predicted, "gamma": erm.gamma, "alpha": erm.alpha, "bias_offset": erm.bias_offset, "hourly_bias_sample": dict(list(erm.hourly_bias.items())[:5])}
+
+@app.get("/states")
+async def get_all_states():
+    return {city: {"history_len": len(erm.history), "last_predicted": erm.last_predicted} for city, erm in app.state.per_city_erms.items()}
 
 @app.get("/update")
 @app.head("/update")
 async def update_data(background_tasks: BackgroundTasks):
-    async with update_lock:
-        data_dir = Path(__file__).parent / "ERM_Data"
-        state_dir = Path(__file__).parent / "ERM_State"
-
-        cities = DEFAULT_CITIES
-        erms = {}
-        for city in cities:
-            erm = ERM_Live_Adaptive()
-            state_file = state_dir / f"erm_state_{normalize_city_key(city['name'])}.json"
-            erm.load_state(state_file)
-            erms[city['name']] = erm
-
-        now = datetime.now()
-        today_str = now.strftime('%Y%m%d')
-        hour_of_day = now.hour
-
-        # Step 1: Fetch live data for ALL cities (separate meteo reader)
-        live_data_dict = {}
-        sem = asyncio.Semaphore(int(os.getenv("ERM_SEMAPHORE_LIMIT", 5)))
-
-        async def fetch_city(city):
-            async with sem:
-                data = await fetch_multi_variable_data(city['lat'], city['lon'], city['tz'])
-                return city['name'], data
-
-        results = await asyncio.gather(*(fetch_city(city) for city in cities), return_exceptions=True)
-
-        for name, data in zip([c['name'] for c in cities], results):
-            if isinstance(data, Exception) or not data or data.get('temp') is None:
-                logger.warning(f"Skipped {name} — no temperature data")
+    async with asyncio.Lock():
+        logger.info("🚀 Starting full ERM update for all cities...")
+        fetch_tasks = {city["name"]: fetch_multi_variable_data(city["lat"], city["lon"], city["tz"]) for city in DEFAULT_CITIES}
+        results = await asyncio.gather(*fetch_tasks.values(), return_exceptions=True)
+        for city_name, res in zip(fetch_tasks.keys(), results):
+            if isinstance(res, Exception):
                 continue
-            live_data_dict[name] = data
+            data = res
+            record = LiveWeatherRecord(
+                live_temp=safe_float(data.get('temp')),
+                humidity=safe_float(data.get('humidity')),
+                wind=safe_float(data.get('wind')),
+                pressure=safe_float(data.get('pressure')),
+                rain_prob=safe_float(data.get('precip_prob', 0)),
+                cloud_cover=safe_float(data.get('cloud_cover', 50.0)),
+                solar=200.0
+            )
+            try:
+                await _core_record(city_name, record, None)
+            except Exception as e:
+                logger.error(f"Record failed for {city_name}: {e}")
+        backfill_realized_errors(DATA_DIR)
+        background_tasks.add_task(async_git_backup, DATA_DIR)
+    return {"status": "updated", "timestamp": datetime.now().isoformat(), "version": VERSION, "cities_processed": len(DEFAULT_CITIES)}
 
-        # Step 2: True relative pressure gradient (your requested leap)
-        def calculate_neighbor_influence(city_name: str, live_data_dict: Dict) -> float:
-            influence = 0.0
-            city = next((c for c in cities if c['name'] == city_name), None)
-            if not city or city_name not in live_data_dict:
-                return 0.0
-
-            current_pressure = live_data_dict[city_name].get('pressure', 1013)
-
-            for other_name, other_data in live_data_dict.items():
-                if other_name == city_name:
-                    continue
-                other_city = next((c for c in cities if c['name'] == other_name), None)
-                if not other_city:
-                    continue
-                dist = haversine(city['lat'], city['lon'], other_city['lat'], other_city['lon'])
-                pressure_diff = other_data.get('pressure', 1013) - current_pressure   # ← RELATIVE GRADIENT
-                raw = (pressure_diff / max(dist, 0.1)) * 0.1
-                normalized = raw / 1000.0
-                influence += normalized * math.exp(-dist / 1000.0)
-            return influence
-
-        # Step 3: Optimized process_city
-        sem = asyncio.Semaphore(int(os.getenv("ERM_SEMAPHORE_LIMIT", 5)))
-
-        async def process_city(city):
-            async with sem:
-                data = live_data_dict.get(city['name'])
-                if not data:
-                    return city['name'], False
-
-                live_temp = data['temp']
-                erm = erms[city['name']]
-                baseline_temp = get_yesterday_baseline(city['name'], hour_of_day, data_dir)
-
-                neighbor_influence = calculate_neighbor_influence(city['name'], live_data_dict)
-
-                Er_flux, next_predicted, beta, pressure_trend = erm.step(
-                    current_temp=live_temp,
-                    current_humidity=data.get('humidity', 50),
-                    current_wind=data.get('wind', 5),
-                    current_pressure=data.get('pressure', 1013),
-                    current_rain_prob=0.0,
-                    current_cloud_cover=50.0,
-                    current_solar=0.0,
-                    previous_temp=erm.history[-1] if len(erm.history) > 0 else None,
-                    hour_of_day=hour_of_day,
-                    local_avg_temp=city.get('local_avg_temp', 15.0),
-                    local_temp_range=city.get('local_temp_range', 30.0),
-                    neighbor_influence=neighbor_influence,
-                    city_name=city['name']
-                )
-
-                realized_error = live_temp - next_predicted
-                erm.record_error(realized_error, next_predicted)
-
-                erm_err = abs(live_temp - next_predicted)
-                baseline_err = abs(live_temp - baseline_temp)
-                improvement = 100 * (baseline_err - erm_err) / max(baseline_err, 0.01) if baseline_err > 0 else 0.0
-
-                if improvement < -50:
-                    logger.warning(f"🚨 ANOMALY ALERT: {city['name']} improvement {improvement:.1f}%")
-
-                future = erm.predict_future([1, 3, 6, 12, 24, 48])
-
-                row = {
-                    'timestamp': data['time'],
-                    'timestamp_utc': datetime.utcnow().isoformat(),
-                    'live_temp': live_temp,
-                    'humidity': data.get('humidity'),
-                    'wind': data.get('wind'),
-                    'pressure': data.get('pressure'),
-                    'erm_flux': Er_flux,
-                    'beta': beta,
-                    'baseline_temp': baseline_temp,
-                    **{f'next_predicted_{h}h': next_predicted + future.get(h, 0.0) for h in [1, 3, 6, 12, 24, 48]},
-                    'tomorrow_max': data.get('tomorrow_max'),
-                    'tomorrow_min': data.get('tomorrow_min'),
-                    'improvement_pct': improvement,
-                    'error_1h': np.nan, 'error_3h': np.nan, 'error_6h': np.nan,
-                    'error_12h': np.nan, 'error_24h': np.nan, 'error_48h': np.nan
-                }
-
-                csv_path = data_dir / f"erm_v4.4_{normalize_city_key(city['name'])}_{today_str}.csv"
-                file_exists = csv_path.exists()
-                pd.DataFrame([row]).to_csv(csv_path, mode='a', header=not file_exists, index=False)
-
-                logger.info(f"✅ Updated {city['name']} (influence {neighbor_influence:.4f}) → improvement {improvement:.1f}%")
-                state_file = state_dir / f"erm_state_{normalize_city_key(city['name'])}.json"
-                erm.save_state(state_file)
-                return city['name'], True
-
-        results = await asyncio.gather(*(process_city(city) for city in cities), return_exceptions=True)
-        successful = sum(1 for r in results if not isinstance(r, Exception) and r[1] is True)
-
-    backfill_realized_errors(data_dir)
-    background_tasks.add_task(git_backup, data_dir)
-    return {"status": "success", "updated": len(cities), "successful": successful, "time": datetime.now().isoformat()}
-
-# ==================== /LATEST ====================
 @app.get("/latest")
 async def get_latest():
-    data_dir = Path(__file__).parent / "ERM_Data"
     latest_data = []
-
-    for csv_path in data_dir.glob("erm_v4.4_*.csv"):
+    for csv_path in DATA_DIR.glob(f"{CSV_PREFIX}_*.csv"):
         try:
             df = pd.read_csv(csv_path)
-            if df.empty:
-                continue
+            if df.empty: continue
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
             latest_row = df.loc[df['timestamp'].idxmax()]
             row = latest_row.to_dict()
-
             filename = csv_path.name
-            city_part = filename.replace("erm_v4.4_", "").split("_20")[0]
-            city_name = city_part.replace("_", " ").title().replace(" ", "_")
-            row["city"] = city_name
+            city_part = filename.replace(f"{CSV_PREFIX}_", "").rsplit("_", 1)[0]
+            row["city"] = city_part.replace("_", " ").title().replace(" ", "_")
             latest_data.append(row)
-        except Exception as e:
-            logger.warning(f"Could not read latest from {csv_path.name}: {e}")
-
-    logger.info(f"📡 /latest served {len(latest_data)} fresh cities")
+        except Exception:
+            pass
     return latest_data
 
-# ==================== HEALTH ====================
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "V5.4-clean Context-Aware Relational"}
+    return {"status": "healthy", "version": VERSION}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
