@@ -244,6 +244,37 @@ class ERM_Live_Adaptive:
             return "stable"
         return "seasonal"
 
+    async def predict_future(self, current_temp: float, steps_list: List[int]) -> Dict:
+        predictions = {}
+        temp = current_temp
+        for step in sorted(steps_list):
+            _, pred, _, _ = await self.step(
+                current_temp=temp,
+                current_humidity=50.0,
+                current_wind=5.0,
+                current_pressure=1013.0,
+                current_rain_prob=0.0,
+                current_cloud_cover=30.0,
+                current_solar=400.0,
+                current_wind_dir=180.0,
+                satellite_cloud_cover=30.0,
+                satellite_radiation=300.0,
+                hour_of_day=datetime.now().hour,
+                local_avg_temp=15.0,
+                neighbor_influence=0.0,
+                dry_run=True
+            )
+            predictions[step] = round(float(pred), 1)
+            temp = pred
+        confidence = round(100 * (1 - abs(self.smoothed_er) / 8.0), 1)
+        return {
+            "next_predicted_1h": predictions.get(1),
+            "future_forecast": predictions,
+            "confidence_percent": confidence,
+            "current_regime": self.current_regime,
+            "performance_score": round(float(self.performance_score), 3)
+        }
+
 # ===================== LIFESPAN =====================
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -310,14 +341,8 @@ async def save_all_city_states(erms: Dict):
                 logger.info(f"✅ Appended record for {name} (total records: {len(erm.history)})")
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
-    # === NEW GITHUB ACTION HANDLES BACKUP ===
-    # await async_git_backup(DATA_DIR, STATE_DIR)  # ← DISABLED — new GitHub Action now does this
+    # Git backup is now handled by the new GitHub Action
     logger.info("📤 Git backup skipped (handled by new GitHub Action)")
-
-# ===================== ROBUST GIT BACKUP (kept for reference, but disabled) =====================
-async def async_git_backup(data_dir: Path, state_dir: Path):
-    # This function is now unused — the dedicated GitHub Action handles persistence
-    pass
 
 # ===================== PERIODIC SAVE =====================
 async def periodic_save(interval_seconds: int = 300):
@@ -353,6 +378,31 @@ async def status():
         "per_city": counts,
         "build_phase": "active — collecting data"
     }
+
+@app.get("/latest")
+async def latest():
+    if not hasattr(app.state, 'per_city_erms'):
+        return {"error": "not_initialized"}
+    data = {}
+    for name, erm in app.state.per_city_erms.items():
+        data[name] = {
+            "live_temp": erm.history[-1] if erm.history else None,
+            "last_predicted": erm.last_predicted,
+            "regime": erm.current_regime
+        }
+    return data
+
+@app.get("/predict/{city}")
+async def predict_city(city: str):
+    erm = app.state.per_city_erms.get(city)
+    if not erm:
+        raise HTTPException(status_code=404, detail="City not found")
+    try:
+        last_temp = erm.history[-1] if erm.history else 15.0
+        return await erm.predict_future(last_temp, [1, 3, 6, 12, 24])
+    except Exception as e:
+        logger.error(f"Predict failed for {city}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
