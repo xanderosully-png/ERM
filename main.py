@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI):
         http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=15, max_keepalive_connections=8), follow_redirects=True)
         for subdir in [DATA_DIR, STATE_DIR]:
             subdir.mkdir(parents=True, exist_ok=True)
-        app.state.per_city_erms = await load_city_states()
+        app.state.per_city_erms = await load_city_states()   # stubbed below
         app.state.save_task = asyncio.create_task(periodic_save())
         app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
         logger.info(f"🚀 ERM {VERSION} started – all 7 new gaps closed")
@@ -224,7 +224,7 @@ DEFAULT_CITIES = [
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# ==================== ERM CLASS v9.0 (all 7 new commits applied) ====================
+# ==================== ERM CLASS v9.0 (clean - no stray code) ====================
 class ERM_Live_Adaptive:
     def __init__(self, history_size: int = 20, debug_mode: bool = False):
         self.history_size = history_size
@@ -382,6 +382,15 @@ class ERM_Live_Adaptive:
 
     async def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
         pass  # placeholder for your full predict_future logic
+
+# ==================== STUBS FOR MISSING ORIGINAL FUNCTIONS ====================
+async def load_city_states():
+    logger.warning("Using stub load_city_states - implement your real logic here")
+    return {city["name"]: ERM_Live_Adaptive() for city in DEFAULT_CITIES}
+
+async def save_all_city_states(erms: dict):
+    logger.info("Stub save_all_city_states called")
+    return
 
 # async_git_backup – FULL IMPLEMENTATION (GitHub-only persistence)
 async def async_git_backup(data_dir: Path, state_dir: Path):
