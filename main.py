@@ -368,7 +368,6 @@ class ERM_Live_Adaptive:
             solar_adjust = np.clip(solar_adjust, -0.8, 1.2)
             
             # Feed into volatility & regime (satellite sees clouds/storms faster)
-            volatility = float(np.std(self.history)) if len(self.history) > 1 else 0.0
             volatility = volatility * (1.0 + 0.3 * (blended_cloud / 100.0))  # clouds increase volatility
 
             self.current_regime = self.detect_regime(self.pressure_history, self.humidity_history, volatility)
