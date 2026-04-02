@@ -30,6 +30,7 @@ CSV_PREFIX = "erm_v9.0"
 # ===================== LOCKS =====================
 city_last_request: Dict[str, float] = {}
 rate_limiter_lock = asyncio.Lock()
+git_backup_lock = asyncio.Lock()
 csv_write_lock = asyncio.Lock()
 
 # ===================== SAFETY HELPERS =====================
@@ -309,7 +310,35 @@ async def save_all_city_states(erms: Dict):
                 logger.info(f"✅ Appended record for {name} (total records: {len(erm.history)})")
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
-    logger.info("📤 Git backup skipped — handled by new GitHub Action")
+    await async_git_backup(DATA_DIR, STATE_DIR)   # ← RE-ENABLED
+
+# ===================== ROBUST GIT BACKUP =====================
+async def async_git_backup(data_dir: Path, state_dir: Path):
+    async with git_backup_lock:
+        token = os.getenv("GITHUB_TOKEN")
+        repo = os.getenv("GITHUB_REPO")
+        if not token or not repo:
+            logger.warning("⚠️ GITHUB_TOKEN or GITHUB_REPO not set in Render environment — skipping git backup")
+            return
+        for attempt in range(3):
+            try:
+                remote_url = f"https://{token}@github.com/{repo}.git"
+                cwd = Path(__file__).parent
+                await asyncio.create_subprocess_exec("git", "add", str(data_dir), cwd=cwd)
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
+                    cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    logger.error(f"Git commit failed: {stderr.decode()}")
+                await asyncio.create_subprocess_exec("git", "push", remote_url, "main", cwd=cwd)
+                logger.info("✅ GitHub backup completed")
+                return
+            except Exception as e:
+                logger.warning(f"Git backup attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2 ** attempt)
+        logger.error("❌ All git backup attempts failed")
 
 # ===================== PERIODIC SAVE =====================
 async def periodic_save(interval_seconds: int = 300):
