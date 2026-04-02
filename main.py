@@ -876,7 +876,7 @@ async def get_volatility_log(limit: int = 100):
     except Exception:
         return {"logs": [], "error": "Could not read volatility log"}
 
-# ==================== LENIENT 5-MINUTE UPDATE ENDPOINT (NEW) ====================
+# ==================== LENIENT 5-MINUTE UPDATE ENDPOINT ====================
 @app.get("/update")
 @app.head("/update")
 async def update_data(background_tasks: BackgroundTasks):
