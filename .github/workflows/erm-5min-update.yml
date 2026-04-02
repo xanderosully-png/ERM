@@ -1,0 +1,24 @@
+name: ERM 5-Minute Update Trigger
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'     # Every 5 minutes
+  workflow_dispatch:          # You can also click "Run workflow" manually
+
+jobs:
+  trigger-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5          # generous timeout for Render cold starts
+
+    steps:
+      - name: Ping ERM /update endpoint
+        run: |
+          echo "🚀 Triggering ERM update - $(date -u)"
+          curl -v --fail --location \
+               --max-time 120 \
+               --retry 3 \
+               --retry-delay 10 \
+               --retry-max-time 180 \
+               https://ermforecast.onrender.com/update \
+               -H "User-Agent: ERM-GitHub-Action/1.0"
+          echo "✅ Update ping completed"
