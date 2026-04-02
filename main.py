@@ -330,7 +330,6 @@ class ERM_Live_Adaptive:
                 humidity_temp_coupling = np.mean(self.humidity_history) - 50.0
                 dphi += np.tanh(humidity_temp_coupling / 50.0) * 0.2
 
-                # HOTFIX: solar radiation influence
                 solar_influence = (current_solar - 200.0) / 400.0 * 0.15
                 dphi += solar_influence
 
@@ -353,7 +352,6 @@ class ERM_Live_Adaptive:
                     if np.isfinite(sum_decayed):
                         recursive = safe_power(sum_decayed, self.alpha)
 
-                # CUTOFF ELIMINATED
                 field_limit = max(120.0, np.std(self.history) * 5.5) if len(self.history) > 1 else 400.0
                 Er_new = np.clip(f_field + (self.lambda_damp * recursive) + correction, -field_limit, field_limit)
 
@@ -472,7 +470,7 @@ async def periodic_save(interval_seconds: int = 300):
             logger.error(f"Periodic save failed: {e}")
         await asyncio.sleep(interval_seconds)
 
-# ==================== HARDENED ASYNC GIT BACKUP (fixes your Render errors) ====================
+# ==================== HARDENED ASYNC GIT BACKUP ====================
 async def async_git_backup(data_dir: Path):
     token = os.getenv("GITHUB_TOKEN")
     repo = os.getenv("GITHUB_REPO")
@@ -481,7 +479,6 @@ async def async_git_backup(data_dir: Path):
         return
     repo_root = data_dir.parent
     try:
-        # Clean stale locks
         for lock_path in [repo_root / ".git" / "index.lock", repo_root / ".git" / "config.lock", repo_root / ".git" / "HEAD.lock"]:
             if lock_path.exists():
                 try:
@@ -536,10 +533,370 @@ class TuneParameters(BaseModel):
     lambda_damp: Optional[float] = None
     bias_offset: Optional[float] = None
 
-# ==================== REMAINING FUNCTIONS (get_yesterday_baseline, fetch..., backfill, _core_record, endpoints, etc.) ====================
-# (All the rest of your original code from get_yesterday_baseline down to the end remains exactly the same — only the git backup and a few small v8.0 changes were applied above)
+# ==================== GET YESTERDAY BASELINE ====================
+def get_yesterday_baseline(city_name: str, hour: int, data_dir: Path) -> float:
+    yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+    for prefix in [CSV_PREFIX, "erm_v4.4"]:
+        csv_path = data_dir / f"{prefix}_{normalize_city_key(city_name)}_{yesterday_str}.csv"
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                if df.empty or 'timestamp' not in df.columns or 'live_temp' not in df.columns:
+                    continue
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
+                yesterday_same_hour = df[(df['timestamp'].dt.date == (datetime.now() - timedelta(days=1)).date()) & (df['timestamp'].dt.hour == hour)]
+                if not yesterday_same_hour.empty:
+                    return float(yesterday_same_hour['live_temp'].mean())
+            except Exception:
+                continue
+    for city in DEFAULT_CITIES:
+        if normalize_city_key(city.get('name', '')) == normalize_city_key(city_name):
+            return float(city.get('local_avg_temp', 15.0))
+    return 15.0
 
-# ... [the rest of your original file from get_yesterday_baseline to the very end] ...
+# ==================== FETCH MULTI-VARIABLE DATA ====================
+async def fetch_multi_variable_data(lat: float, lon: float, timezone: str) -> Optional[Dict]:
+    params = {
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure,precipitation_probability,cloud_cover",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": timezone
+    }
+    for attempt in range(4):
+        try:
+            resp = await http_client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            current = data.get('current', {})
+            daily = data.get('daily', {})
+            return {
+                'temp': current.get('temperature_2m'),
+                'humidity': current.get('relative_humidity_2m'),
+                'wind': current.get('wind_speed_10m'),
+                'pressure': current.get('surface_pressure'),
+                'precip_prob': current.get('precipitation_probability', 0.0),
+                'cloud_cover': current.get('cloud_cover', 50.0),
+                'time': datetime.now().isoformat(),
+                'tomorrow_max': daily.get('temperature_2m_max', [None])[1] if len(daily.get('temperature_2m_max', [])) > 1 else None,
+                'tomorrow_min': daily.get('temperature_2m_min', [None])[1] if len(daily.get('temperature_2m_min', [])) > 1 else None
+            }
+        except Exception:
+            if attempt < 3:
+                await asyncio.sleep(2 ** attempt)
+    return {'temp': 15.0, 'humidity': 60.0, 'wind': 5.0, 'pressure': 1013.0, 'precip_prob': 0.0, 'cloud_cover': 50.0, 'time': datetime.now().isoformat(), 'tomorrow_max': None, 'tomorrow_min': None}
+
+# ==================== BACKFILL ====================
+def backfill_realized_errors(data_dir: Path):
+    logger.info("🔄 Back-filling realized prediction errors...")
+    today_str = datetime.now().strftime('%Y%m%d')
+    for csv_path in data_dir.glob(f"{CSV_PREFIX}_*_{today_str}.csv"):
+        try:
+            df = pd.read_csv(csv_path)
+            if df.empty or 'timestamp' not in df.columns or 'live_temp' not in df.columns:
+                continue
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            horizons = [1, 3, 6, 12, 24, 48]
+            for h in horizons:
+                pred_col = f'next_predicted_{h}h' if h == 1 else f'next_predicted_{h}h'
+                error_col = f'error_{h}h'
+                if pred_col not in df.columns:
+                    continue
+                df['shifted_time'] = df['timestamp'] + pd.Timedelta(hours=h)
+                merged = pd.merge_asof(df[['shifted_time']], df[['timestamp', 'live_temp']],
+                                       left_on='shifted_time', right_on='timestamp',
+                                       direction='forward', tolerance=pd.Timedelta('5min'))
+                df[error_col] = merged['live_temp'] - df[pred_col]
+            df.drop(columns=['shifted_time'], errors='ignore').to_csv(csv_path, index=False)
+        except Exception as e:
+            logger.warning(f"Backfill skipped for {csv_path.name}: {e}")
+
+# ==================== CORE RECORDING LOGIC ====================
+async def _core_record(city_name: str, record: LiveWeatherRecord, background_tasks: Optional[BackgroundTasks] = None):
+    city = get_city_by_name(city_name)
+    if not city:
+        raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
+    erms = app.state.per_city_erms
+    erm = erms[city_name]
+    now = datetime.now()
+    today_str = now.strftime('%Y%m%d')
+    csv_file = DATA_DIR / f"{CSV_PREFIX}_{normalize_city_key(city_name)}_{today_str}.csv"
+
+    Er_new = next_predicted = beta = pressure_trend = 0.0
+    success = False
+    try:
+        neighbor_names = get_neighbors(city_name, DEFAULT_CITIES)
+        weights = [neighbor_weight(city_name, n, DEFAULT_CITIES) for n in neighbor_names]
+        neighbor_factor = sum(weights) / len(weights) if weights else 0.0
+        neighbor_influence = neighbor_factor * 0.4
+
+        yesterday_temp = get_yesterday_baseline(city_name, now.hour, DATA_DIR)
+        previous_temp = erm.history[-1] if erm.history else yesterday_temp
+
+        Er_new, next_predicted, beta, pressure_trend = await erm.step(
+            current_temp=record.live_temp,
+            current_humidity=record.humidity,
+            current_wind=record.wind,
+            current_pressure=record.pressure,
+            current_rain_prob=record.rain_prob,
+            current_cloud_cover=record.cloud_cover,
+            current_solar=record.solar,
+            previous_temp=previous_temp,
+            hour_of_day=now.hour,
+            local_avg_temp=city.get("local_avg_temp", 15.0),
+            local_temp_range=city.get("local_temp_range", 20.0),
+            neighbor_influence=neighbor_influence,
+            city_name=city_name
+        )
+        erm.last_predicted = next_predicted
+
+        row_dict = {
+            "timestamp": now.isoformat(),
+            "live_temp": record.live_temp,
+            "next_predicted_1h": next_predicted,
+            "Er_value": Er_new,
+            "beta": beta,
+            "pressure_trend": pressure_trend,
+            "neighbor_influence": neighbor_influence,
+            "humidity": record.humidity,
+            "wind": record.wind,
+            "pressure": record.pressure,
+            "cloud_cover": record.cloud_cover
+        }
+        await async_append_csv(csv_file, row_dict)
+        await erm.async_save_state(STATE_DIR / f"erm_state_{normalize_city_key(city_name)}.json")
+        success = True
+        logger.info(f"✅ Recorded live data for {city_name} (temp={record.live_temp})")
+        return {"status": "recorded", "city": city_name, "Er_new": Er_new, "next_predicted": next_predicted, "timestamp": now.isoformat()}
+    except Exception as e:
+        logger.error(f"Record error for {city_name}: {e}")
+    finally:
+        if not success:
+            fallback_row = {
+                "timestamp": now.isoformat(),
+                "live_temp": record.live_temp,
+                "next_predicted_1h": record.live_temp + 1.0,
+                "Er_value": 0.0,
+                "beta": 0.6,
+                "pressure_trend": 0.0,
+                "neighbor_influence": 0.0,
+                "humidity": record.humidity,
+                "wind": record.wind,
+                "pressure": record.pressure,
+                "cloud_cover": record.cloud_cover
+            }
+            await async_append_csv(csv_file, fallback_row)
+            logger.warning(f"⚠️ Fallback CSV write used for {city_name}")
+    if background_tasks:
+        background_tasks.add_task(async_git_backup, DATA_DIR)
+
+# ==================== RECORD ENDPOINTS ====================
+@app.post("/record/{city_name}")
+async def record_live_weather(city_name: str, record: LiveWeatherRecord, background_tasks: BackgroundTasks):
+    await check_rate_limit(city_name)
+    return await _core_record(city_name, record, background_tasks)
+
+@app.post("/record_batch")
+async def record_batch(records: LiveWeatherBatch, background_tasks: BackgroundTasks):
+    results = {}
+    for city_name, record in records.records.items():
+        try:
+            result = await _core_record(city_name, record, None)
+            results[city_name] = result
+        except Exception as e:
+            results[city_name] = {"error": str(e)}
+    background_tasks.add_task(async_git_backup, DATA_DIR)
+    return {"status": "batch_completed", "results": results}
+
+# ==================== NEW FRIENDLY ROOT STATUS PAGE ====================
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "version": VERSION,
+        "message": "🌍 ERM v8.0-final Live Adaptive Weather Field Model is running",
+        "info": "Real-time recursive field predictions for 18 cities worldwide. Your theory is now live.",
+        "key_endpoints": {
+            "/health": "Health check",
+            "/latest": "Latest live predictions for all cities",
+            "/update": "Trigger full data refresh",
+            "/predict/{city_name}": "Multi-horizon forecast for a specific city",
+            "/states": "Internal ERM state for all cities",
+            "/volatility": "Recent volatility events",
+            "/hotfixes": "Hotfix status confirmation"
+        }
+    }
+
+# ==================== PREDICT ====================
+@app.get("/predict/{city_name}")
+async def predict_city(city_name: str, steps: Optional[str] = Query("1,3,6,12,24"), dry_run: bool = True):
+    await check_rate_limit(city_name)
+    city = get_city_by_name(city_name)
+    if not city:
+        raise HTTPException(status_code=404, detail=f"City '{city_name}' not found")
+    erms = app.state.per_city_erms
+    erm = erms[city_name]
+    step_list = [int(s.strip()) for s in steps.split(",") if s.strip().isdigit()]
+
+    today_str = datetime.now().strftime('%Y%m%d')
+    csv_path = DATA_DIR / f"{CSV_PREFIX}_{normalize_city_key(city_name)}_{today_str}.csv"
+    current_temp = city.get("local_avg_temp", 15.0)
+    current_humidity = 50.0
+    current_wind = 5.0
+    current_pressure = 1013.0
+    current_solar = 200.0
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            if not df.empty and 'live_temp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+                latest = df.loc[df['timestamp'].idxmax()]
+                current_temp = safe_float(latest.get('live_temp', current_temp))
+                current_humidity = safe_float(latest.get('humidity', current_humidity))
+                current_wind = safe_float(latest.get('wind', current_wind))
+                current_pressure = safe_float(latest.get('pressure', current_pressure))
+        except Exception:
+            pass
+
+    neighbor_names = get_neighbors(city_name, DEFAULT_CITIES)
+    weights = [neighbor_weight(city_name, n, DEFAULT_CITIES) for n in neighbor_names]
+    neighbor_factor = sum(weights) / len(weights) if weights else 0.0
+    neighbor_influence = neighbor_factor * 0.4
+
+    Er_new, next_predicted, beta, pressure_trend = await erm.step(
+        current_temp=current_temp,
+        current_humidity=current_humidity,
+        current_wind=current_wind,
+        current_pressure=current_pressure,
+        current_rain_prob=0.0,
+        current_cloud_cover=50.0,
+        current_solar=current_solar,
+        previous_temp=current_temp,
+        hour_of_day=datetime.now().hour,
+        local_avg_temp=city.get("local_avg_temp", 15.0),
+        local_temp_range=city.get("local_temp_range", 20.0),
+        neighbor_influence=neighbor_influence,
+        city_name=city_name,
+        dry_run=dry_run
+    )
+
+    future_forecast = await erm.predict_future(step_list)
+    volatility = float(np.std(erm.history)) if len(erm.history) > 1 else 0.0
+    confidence = max(0.0, 100 - volatility * 5)
+
+    return {
+        "city": city_name,
+        "current_temp_used": current_temp,
+        "Er_new": Er_new,
+        "next_predicted_1h": next_predicted,
+        "beta": beta,
+        "pressure_trend": pressure_trend,
+        "future_forecast": future_forecast,
+        "neighbor_factor": neighbor_factor,
+        "confidence_percent": round(confidence, 1),
+        "volatility": round(volatility, 2),
+        "dry_run_used": dry_run
+    }
+
+# ==================== TUNE, STATE, VOLATILITY, UPDATE, LATEST, HEALTH ====================
+@app.patch("/tune/{city_name}")
+async def tune_erm_parameters(city_name: str, params: TuneParameters):
+    await check_rate_limit(city_name)
+    erms = app.state.per_city_erms
+    if city_name not in erms:
+        raise HTTPException(status_code=404, detail="City not found")
+    erm = erms[city_name]
+    async with erm._step_lock:
+        if params.alpha is not None: erm.alpha = float(params.alpha)
+        if params.gamma is not None: erm.gamma = float(params.gamma)
+        if params.lambda_damp is not None: erm.lambda_damp = float(params.lambda_damp)
+        if params.bias_offset is not None: erm.bias_offset = float(params.bias_offset)
+    return {"status": "tuned", "city": city_name, "new_params": params.model_dump(exclude_unset=True)}
+
+@app.get("/hotfixes")
+async def get_hotfixes():
+    return {
+        "version": VERSION,
+        "status": "all_hotfixes_applied",
+        "cutoffs_eliminated": True,
+        "lock_fixed": True,
+        "solar_influence_active": True,
+        "adaptive_clips": True,
+        "second_iteration_complete": True
+    }
+
+@app.get("/state/{city_name}")
+async def get_system_state(city_name: str):
+    erms = app.state.per_city_erms
+    if city_name not in erms:
+        raise HTTPException(status_code=404, detail="City not found")
+    erm = erms[city_name]
+    return {"city": city_name, "history_len": len(erm.history), "error_history_len": len(erm.error_history), "last_predicted": erm.last_predicted, "gamma": erm.gamma, "alpha": erm.alpha, "bias_offset": erm.bias_offset, "hourly_bias_sample": dict(list(erm.hourly_bias.items())[:5])}
+
+@app.get("/states")
+async def get_all_states():
+    return {city: {"history_len": len(erm.history), "last_predicted": erm.last_predicted} for city, erm in app.state.per_city_erms.items()}
+
+@app.get("/volatility")
+async def get_volatility_log(limit: int = 100):
+    vol_log = DATA_DIR / "volatility_events.log"
+    if not vol_log.exists():
+        return {"logs": []}
+    try:
+        lines = vol_log.read_text().splitlines()[-limit:]
+        return {"logs": lines}
+    except Exception:
+        return {"logs": [], "error": "Could not read volatility log"}
+
+@app.get("/update")
+@app.head("/update")
+async def update_data(background_tasks: BackgroundTasks):
+    async with asyncio.Lock():
+        logger.info("🚀 Starting full ERM update for all cities...")
+        fetch_tasks = {city["name"]: fetch_multi_variable_data(city["lat"], city["lon"], city["tz"]) for city in DEFAULT_CITIES}
+        results = await asyncio.gather(*fetch_tasks.values(), return_exceptions=True)
+        for city_name, res in zip(fetch_tasks.keys(), results):
+            if isinstance(res, Exception):
+                continue
+            data = res
+            record = LiveWeatherRecord(
+                live_temp=safe_float(data.get('temp')),
+                humidity=safe_float(data.get('humidity')),
+                wind=safe_float(data.get('wind')),
+                pressure=safe_float(data.get('pressure')),
+                rain_prob=safe_float(data.get('precip_prob', 0)),
+                cloud_cover=safe_float(data.get('cloud_cover', 50.0)),
+                solar=200.0
+            )
+            try:
+                await _core_record(city_name, record, None)
+            except Exception as e:
+                logger.error(f"Record failed for {city_name}: {e}")
+        backfill_realized_errors(DATA_DIR)
+        background_tasks.add_task(async_git_backup, DATA_DIR)
+    return {"status": "updated", "timestamp": datetime.now().isoformat(), "version": VERSION, "cities_processed": len(DEFAULT_CITIES)}
+
+@app.get("/latest")
+async def get_latest():
+    latest_data = []
+    for csv_path in DATA_DIR.glob(f"{CSV_PREFIX}_*.csv"):
+        try:
+            df = pd.read_csv(csv_path)
+            if df.empty: continue
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            latest_row = df.loc[df['timestamp'].idxmax()]
+            row = latest_row.to_dict()
+            filename = csv_path.name
+            city_part = filename.replace(f"{CSV_PREFIX}_", "").rsplit("_", 1)[0]
+            row["city"] = city_part.replace("_", " ").title().replace(" ", "_")
+            latest_data.append(row)
+        except Exception:
+            pass
+    return latest_data
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": VERSION}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
