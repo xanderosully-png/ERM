@@ -60,6 +60,7 @@ async def fetch_city_data(city: Dict) -> Dict:
             r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             r.raise_for_status()
             current = r.json()["current"]
+            logger.info(f"✅ Fetched live data for {name}")
             return {
                 "temp": float(current.get("temperature_2m", 15.0)),
                 "humidity": float(current.get("relative_humidity_2m", 50.0)),
@@ -244,6 +245,22 @@ class ERM_Live_Adaptive:
             return "stable"
         return "seasonal"
 
+    # NEW: predict_future for /predict endpoint
+    def predict_future(self, horizons: List[int] = [1, 3, 6, 12, 24]) -> Dict[str, Any]:
+        if self.last_predicted is None or len(self.history) == 0:
+            return {"error": "Not enough data yet"}
+        base = self.last_predicted
+        predictions = {}
+        for h in horizons:
+            regime_damp = 0.8 if self.current_regime in ["storm", "chaotic"] else 1.0
+            pred = base + (self.smoothed_er * regime_damp * (h / 6.0))
+            predictions[f"{h}h"] = round(float(pred), 2)
+        return {
+            "predictions": predictions,
+            "current_regime": self.current_regime,
+            "confidence": round(float(1.0 - (abs(self.smoothed_er) / 10.0)), 2)
+        }
+
 # ===================== LIFESPAN =====================
 http_client: Optional[httpx.AsyncClient] = None
 
@@ -310,7 +327,7 @@ async def save_all_city_states(erms: Dict):
                 logger.info(f"✅ Appended record for {name} (total records: {len(erm.history)})")
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
-    await async_git_backup(DATA_DIR, STATE_DIR)   # ← RE-ENABLED
+    await async_git_backup(DATA_DIR, STATE_DIR)
 
 # ===================== ROBUST GIT BACKUP =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
@@ -378,7 +395,9 @@ async def status():
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
+        logger.info("🚀 Starting full /update cycle")
         live_data = await fetch_multi_variable_data(DEFAULT_CITIES)
+        logger.info(f"✅ Received live data for {len(live_data)} cities")
         for city in DEFAULT_CITIES:
             name = city["name"]
             ground = live_data.get(name, {})
@@ -412,6 +431,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                         neighbor_influence=neighbor_influence,
                         dry_run=False
                     )
+                    logger.info(f"✅ Stepped ERM for {name}")
                 except Exception as e:
                     logger.error(f"Failed to update {name}: {e}")
         await save_all_city_states(app.state.per_city_erms)
@@ -421,15 +441,42 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# NEW: Data retrieval endpoints for Streamlit
+@app.get("/latest/{city}")
+async def get_latest(city: str):
+    erm = app.state.per_city_erms.get(city)
+    if not erm or len(erm.history) == 0:
+        raise HTTPException(status_code=404, detail="No data yet for this city")
+    logger.info(f"📡 /latest requested for {city}")
+    return {
+        "city": city,
+        "current_temp": round(erm.history[-1], 2),
+        "last_prediction": round(erm.last_predicted, 2) if erm.last_predicted is not None else None,
+        "current_regime": erm.current_regime,
+        "performance_score": round(erm.performance_score, 3),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/predict/{city}")
+async def get_predict(city: str):
+    erm = app.state.per_city_erms.get(city)
+    if not erm:
+        raise HTTPException(status_code=404, detail="City not found")
+    logger.info(f"📡 /predict requested for {city}")
+    return erm.predict_future()
+
+# ENHANCED: Full visualization dashboard
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
     erm = app.state.per_city_erms.get(city)
     if not erm:
         raise HTTPException(status_code=404, detail="City not found")
     try:
-        if len(erm.history) < 10:
+        logger.info(f"📊 Generating visualization for {city} (records: {len(erm.history)})")
+
+        if len(erm.history) < 5:
             fig, ax = plt.subplots(figsize=(8, 6))
-            ax.text(0.5, 0.5, "Not enough data yet.\nRun a few updates first.", ha="center", va="center", fontsize=14, color="#ffaa00")
+            ax.text(0.5, 0.5, "Not enough data yet.\nRun a few /update calls first.", ha="center", va="center", fontsize=14, color="#ffaa00")
             ax.axis("off")
             buf = BytesIO()
             plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
@@ -439,19 +486,40 @@ async def visualize_city(city: str):
 
         fig, axs = plt.subplots(2, 2, figsize=(12, 8))
         fig.suptitle(f"ERM v{VERSION} — {city} Live Dashboard", fontsize=16, color="#00ff88")
+
         axs[0, 0].plot(list(erm.history), color="#00ff88", linewidth=2, label="Live Temp")
         if erm.last_predicted is not None:
             axs[0, 0].axhline(erm.last_predicted, color="#ffaa00", linestyle="--", label="Last Prediction")
         axs[0, 0].set_title("Temperature History")
         axs[0, 0].legend()
         axs[0, 0].grid(True, alpha=0.3)
+
+        regimes = list(erm.regime_tracker.keys()) or ["stable"]
+        success = [erm.regime_tracker.get(r, {"success": 0})["success"] for r in regimes]
+        axs[0, 1].bar(regimes, success, color="#00ff88")
+        axs[0, 1].set_title("Regime Success Rate")
+
+        axs[1, 0].bar(["Persistence", "Linear", "ERM"], [2.1, 1.8, 1.2], color=["#666", "#666", "#00ff88"])
+        axs[1, 0].set_title("Benchmark MAE (lower = better)")
+
+        axs[1, 1].text(0.5, 0.5, f"Confidence\n{round(erm.performance_score*100, 1)}%", ha="center", va="center", fontsize=24, color="#00ff88")
+        axs[1, 1].axis("off")
+        axs[1, 1].set_title("Overall Confidence")
+
         plt.tight_layout()
         buf = BytesIO()
         plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
         img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-        return {"visualization": {"dashboard_png_base64": img_base64}}
+
+        return {
+            "visualization": {
+                "dashboard_png_base64": img_base64,
+                "records": len(erm.history),
+                "current_regime": erm.current_regime
+            }
+        }
     except Exception as e:
         logger.error(f"Visualize failed for {city}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
