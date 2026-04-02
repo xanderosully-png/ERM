@@ -1,16 +1,30 @@
+# render.yaml
+# Updated for ERM v9.1 (git backup + visualizations)
+# Just add this file (or replace your existing one) — Render will detect it automatically
+
 services:
   - type: web
     name: erm-live
     env: python
-    plan: free
+    plan: free                  # ← change to "starter" or "pro" if you upgraded
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python -m uvicorn app:main --host 0.0.0.0 --port $PORT"
+    
+    # === NEW: Environment variables for async_git_backup ===
     envVars:
       - key: GITHUB_TOKEN
-        sync: false
+        sync: false               # secret — never shown in UI
       - key: GITHUB_REPO
-        sync: false
+        sync: false               # example: "yourusername/erm-live-data"
       - key: PYTHON_VERSION
-        value: "3.12"   # already good
-    # Optional: add a health check route
+        value: "3.12"
+    
+    # Optional but recommended
     healthCheckPath: "/health"
+    autoDeploy: true
+    
+    # If you want persistent disk for ERM_Data / ERM_State (recommended)
+    disk:
+      name: erm-data
+      mountPath: /opt/render/project/src/ERM_Data
+      sizeGB: 1
