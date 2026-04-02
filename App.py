@@ -9,7 +9,7 @@ import numpy as np
 st.set_page_config(page_title="ERM v9.1 — Truth Detector", layout="wide", page_icon="🌍")
 
 st.sidebar.header("🔧 Truth Detector Controls")
-backend_url = st.sidebar.text_input("Backend URL", value="https://ermforecast.onrender.com")
+backend_url = st.sidebar.text_input("Backend URL", value="https://erm-live.onrender.com")
 refresh_interval = st.sidebar.slider("Auto-refresh (seconds)", 30, 300, 60)
 
 st.sidebar.markdown("---")
