@@ -1,40 +1,16 @@
-version: "1"
-
 services:
   - type: web
-    name: erm-v8-live
+    name: erm-live
     env: python
     plan: free
-    pythonVersion: "3.12"
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --no-access-log
-    autoDeploy: true
-
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m uvicorn app:main --host 0.0.0.0 --port $PORT"
     envVars:
       - key: GITHUB_TOKEN
         sync: false
       - key: GITHUB_REPO
-        value: ${{ github.repository }}
-      - key: PORT
-        value: "10000"
-
-    # No persistent disk — everything lives in GitHub
-    healthCheckPath: /health
-
-  - type: cron
-    name: erm-daily-update
-    env: python
-    schedule: "0 */6 * * *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: |
-      python -c '
-      import asyncio, httpx
-      async def trigger():
-          async with httpx.AsyncClient() as client:
-              try:
-                  resp = await client.get("https://ermforecast.onrender.com/update", timeout=60.0)
-                  print("Update triggered:", resp.json())
-              except Exception as e:
-                  print("Update failed:", e)
-      asyncio.run(trigger())
-      '
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12"   # already good
+    # Optional: add a health check route
+    healthCheckPath: "/health"
