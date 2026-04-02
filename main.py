@@ -310,35 +310,14 @@ async def save_all_city_states(erms: Dict):
                 logger.info(f"✅ Appended record for {name} (total records: {len(erm.history)})")
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
-    await async_git_backup(DATA_DIR, STATE_DIR)
+    # === NEW GITHUB ACTION HANDLES BACKUP ===
+    # await async_git_backup(DATA_DIR, STATE_DIR)  # ← DISABLED — new GitHub Action now does this
+    logger.info("📤 Git backup skipped (handled by new GitHub Action)")
 
-# ===================== ROBUST GIT BACKUP =====================
+# ===================== ROBUST GIT BACKUP (kept for reference, but disabled) =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
-    async with git_backup_lock:
-        token = os.getenv("GITHUB_TOKEN")
-        repo = os.getenv("GITHUB_REPO")
-        if not token or not repo:
-            logger.warning("⚠️ GITHUB_TOKEN or GITHUB_REPO not set — skipping git backup")
-            return
-        for attempt in range(3):
-            try:
-                remote_url = f"https://{token}@github.com/{repo}.git"
-                cwd = Path(__file__).parent
-                await asyncio.create_subprocess_exec("git", "add", str(data_dir), cwd=cwd)
-                proc = await asyncio.create_subprocess_exec(
-                    "git", "commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
-                    cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode != 0:
-                    logger.error(f"Git commit failed: {stderr.decode()}")
-                await asyncio.create_subprocess_exec("git", "push", remote_url, "main", cwd=cwd)
-                logger.info("✅ GitHub backup completed")
-                return
-            except Exception as e:
-                logger.warning(f"Git backup attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(2 ** attempt)
-        logger.error("❌ All git backup attempts failed")
+    # This function is now unused — the dedicated GitHub Action handles persistence
+    pass
 
 # ===================== PERIODIC SAVE =====================
 async def periodic_save(interval_seconds: int = 300):
@@ -383,7 +362,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
             name = city["name"]
             ground = live_data.get(name, {})
 
-            # per-city rate limiting
             now = datetime.now().timestamp()
             async with rate_limiter_lock:
                 if now - city_last_request.get(name, 0) < RATE_LIMIT_WINDOW:
