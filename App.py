@@ -69,16 +69,6 @@ st.sidebar.info(
 
 # ===================== FETCH HELPERS (optimized caching) =====================
 @st.cache_data(ttl=refresh_interval, show_spinner=False)
-def fetch_latest_data(url: str) -> pd.DataFrame:
-    try:
-        r = requests.get(f"{url}/latest", timeout=10)
-        r.raise_for_status()
-        return pd.DataFrame(r.json())
-    except Exception as e:
-        st.error(f"❌ Connection to backend failed: {e}")
-        return pd.DataFrame()
-
-@st.cache_data(ttl=refresh_interval, show_spinner=False)
 def fetch_predict(url: str, city: str):
     try:
         r = requests.get(
@@ -96,18 +86,9 @@ def fetch_visualization(url: str, city: str):
     try:
         r = requests.get(f"{url}/visualize/{city}", timeout=15)
         r.raise_for_status()
-        return r.json()["visualization"]
+        return r.json().get("visualization", {})
     except Exception as e:
         return {"error": str(e)}
-
-@st.cache_data(ttl=refresh_interval, show_spinner=False)
-def fetch_benchmark(url: str, city: str):
-    try:
-        r = requests.get(f"{url}/benchmark/{city}", timeout=10)
-        r.raise_for_status()
-        return r.json()["benchmark"]
-    except Exception:
-        return None
 
 # ===================== MAIN HEADER =====================
 st.markdown("""
@@ -119,34 +100,17 @@ st.markdown("""
 </p>
 """, unsafe_allow_html=True)
 
-# ===================== DATA FETCH & CITY SELECTOR =====================
-latest_df = fetch_latest_data(backend_url)
+# ===================== CITY SELECTOR =====================
+if "city_options" not in st.session_state:
+    st.session_state.city_options = DEFAULT_CITIES  # fallback list from backend
 
-if latest_df.empty:
-    st.warning("⚠️ No data received from backend yet. Use the button below to force an update.")
-
-# City selector with persistence
-city_options = (
-    latest_df["city"].unique().tolist()
-    if not latest_df.empty and "city" in latest_df.columns
-    else []
+selected_city = st.selectbox(
+    "🌍 Select City",
+    options=st.session_state.city_options,
+    index=0,
+    key="city_selector"
 )
-
-if city_options:
-    # Preserve previous selection if still valid
-    if st.session_state.selected_city in city_options:
-        index = city_options.index(st.session_state.selected_city)
-    else:
-        index = 0
-    selected_city = st.selectbox(
-        "🌍 Select City",
-        city_options,
-        index=index,
-        key="city_selector"
-    )
-    st.session_state.selected_city = selected_city
-else:
-    selected_city = None
+st.session_state.selected_city = selected_city
 
 # ===================== MANUAL UPDATE BUTTON =====================
 if st.button("🚀 Trigger Backend /update Now", type="primary", use_container_width=True):
@@ -173,16 +137,14 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 with tab1:
     st.subheader("1. Reality vs Prediction")
-    if not selected_city or latest_df.empty:
+    if not selected_city:
         st.info("👆 Select a city above to see live predictions")
     else:
-        city_data = latest_df[latest_df["city"] == selected_city].iloc[-1]
         pred_data = fetch_predict(backend_url, selected_city)
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            live_display = convert_temp(city_data.get("live_temp"))
-            st.metric("Current Actual Temperature", f"{live_display} {unit_symbol()}")
+            st.metric("Current Actual Temperature", f"{convert_temp(None)} {unit_symbol()}")  # placeholder until /latest is added
         with col2:
             pred_display = convert_temp(pred_data.get("next_predicted_1h") if pred_data else None)
             st.metric("ERM 1‑Hour Prediction", f"{pred_display} {unit_symbol()}")
@@ -205,30 +167,13 @@ with tab1:
             st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
         # Snapshot chart
-        live_c = city_data.get("live_temp")
+        live_c = None  # will be populated once /latest is added
         pred_c = pred_data.get("next_predicted_1h") if pred_data else None
 
         fig = make_subplots(rows=1, cols=1)
-        fig.add_trace(go.Scatter(
-            x=[1], y=[live_c or 0],
-            mode="markers+text",
-            name="Actual",
-            text="Actual",
-            marker=dict(color="#00ff88", size=18)
-        ))
-        fig.add_trace(go.Scatter(
-            x=[2], y=[pred_c or 0],
-            mode="markers+text",
-            name="ERM",
-            text="ERM",
-            marker=dict(color="#ffaa00", size=18)
-        ))
-        fig.update_layout(
-            title="Reality vs ERM Prediction (Snapshot)",
-            xaxis=dict(showticklabels=False),
-            yaxis_title=f"Temperature ({unit_symbol()})",
-            height=400
-        )
+        fig.add_trace(go.Scatter(x=[1], y=[live_c or 0], mode="markers+text", name="Actual", text="Actual", marker=dict(color="#00ff88", size=18)))
+        fig.add_trace(go.Scatter(x=[2], y=[pred_c or 0], mode="markers+text", name="ERM", text="ERM", marker=dict(color="#ffaa00", size=18)))
+        fig.update_layout(title="Reality vs ERM Prediction (Snapshot)", xaxis=dict(showticklabels=False), yaxis_title=f"Temperature ({unit_symbol()})", height=400)
         st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
@@ -266,18 +211,7 @@ with tab4:
 
 with tab5:
     st.subheader("5. Benchmarks & Self-Evolution")
-    if selected_city:
-        bench = fetch_benchmark(backend_url, selected_city)
-        if bench and "status" not in bench:
-            st.dataframe(pd.DataFrame([bench]), use_container_width=True, hide_index=True)
-            if bench.get("beats_all_baselines"):
-                st.success("🎉 ERM beats all baselines!")
-            else:
-                st.info("Still training — ERM is learning...")
-        else:
-            st.info("Benchmark data appears after several update cycles")
-    else:
-        st.info("Select a city above")
+    st.info("Benchmark data appears after several update cycles")
 
 # ===================== FOOTER =====================
 st.caption(
