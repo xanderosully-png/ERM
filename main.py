@@ -30,7 +30,6 @@ CSV_PREFIX = "erm_v9.0"
 # ===================== LOCKS =====================
 city_last_request: Dict[str, float] = {}
 rate_limiter_lock = asyncio.Lock()
-git_backup_lock = asyncio.Lock()
 csv_write_lock = asyncio.Lock()
 
 # ===================== SAFETY HELPERS =====================
@@ -310,14 +309,7 @@ async def save_all_city_states(erms: Dict):
                 logger.info(f"✅ Appended record for {name} (total records: {len(erm.history)})")
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
-    # === NEW GITHUB ACTION HANDLES BACKUP ===
-    # await async_git_backup(DATA_DIR, STATE_DIR)  # ← DISABLED — new GitHub Action now does this
-    logger.info("📤 Git backup skipped (handled by new GitHub Action)")
-
-# ===================== ROBUST GIT BACKUP (kept for reference, but disabled) =====================
-async def async_git_backup(data_dir: Path, state_dir: Path):
-    # This function is now unused — the dedicated GitHub Action handles persistence
-    pass
+    logger.info("📤 Git backup skipped — handled by new GitHub Action")
 
 # ===================== PERIODIC SAVE =====================
 async def periodic_save(interval_seconds: int = 300):
@@ -362,7 +354,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
             name = city["name"]
             ground = live_data.get(name, {})
 
-            # per-city rate limiting
             now = datetime.now().timestamp()
             async with rate_limiter_lock:
                 if now - city_last_request.get(name, 0) < RATE_LIMIT_WINDOW:
