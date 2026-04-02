@@ -1,31 +1,76 @@
+version: "1"
+
+# ================================================
+# ERM v8.0-final — Render.com Blueprint
+# Deploy FastAPI + persistent data + git backup
+# ================================================
+
 services:
-  # 1. Your existing FastAPI backend (the one that runs /update)
   - type: web
-    name: erm-forecast-backend
-    runtime: python
-    region: ohio
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn update_service:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
+    name: erm-v8-live
+    env: python
+    plan: free                # Change to "starter" or "standard" for production
+    pythonVersion: "3.12"
+    buildCommand: |
+      pip install --upgrade pip
+      pip install fastapi uvicorn[standard] httpx pandas numpy aiofiles pydantic python-multipart
+    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT --no-access-log
+    autoDeploy: true
+
+    # Environment variables (add your secrets in Render dashboard)
     envVars:
       - key: GITHUB_TOKEN
         sync: false
       - key: GITHUB_REPO
-        value: xanderosully-png/ERM
-        sync: false
-      - key: ERM_SEMAPHORE_LIMIT
-        value: "5"
-        sync: false
-    autoDeploy: true
+        value: ${{ github.repository }}   # Auto-filled from GitHub
+      - key: PORT
+        value: "10000"                    # Render default
 
-  # 2. New Streamlit dashboard (visualization)
-  - type: web
-    name: erm-forecast-dashboard
-    runtime: python
-    region: ohio
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run dashboard.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
-    healthCheckPath: /_stcore/health
-    autoDeploy: true
+    # Persistent storage for ERM_Data and ERM_State (survives deploys/restarts)
+    disk:
+      name: erm-data-disk
+      mountPath: /opt/render/project/src/ERM_Data
+      sizeGB: 10
+    # Note: STATE_DIR is a sibling folder inside the same disk mount
+    # The app will automatically create ERM_State/ next to ERM_Data/
+
+    # Health check (Render will call /health)
+    healthCheckPath: /health
+
+    # Optional: route all traffic through this service
+    domains:
+      - erm-v8.onrender.com   # Render will assign this; change after first deploy
+
+# Optional: Cron job to trigger /update every 6 hours (keeps data fresh)
+  - type: cron
+    name: erm-daily-update
+    env: python
+    schedule: "0 */6 * * *"
+    buildCommand: pip install httpx
+    startCommand: |
+      python -c '
+      import asyncio, httpx, os
+      async def trigger():
+          async with httpx.AsyncClient() as client:
+              try:
+                  resp = await client.get("https://erm-v8.onrender.com/update", timeout=60.0)
+                  print("Update triggered:", resp.json())
+              except Exception as e:
+                  print("Update failed:", e)
+      asyncio.run(trigger())
+      '
+
+# ================================================
+# How to deploy:
+# 1. Save this file as render.yaml in your repo root
+# 2. Push to GitHub (main branch)
+# 3. Go to https://dashboard.render.com → New → Blueprint
+# 4. Connect your GitHub repo → Render will auto-detect render.yaml
+# 5. Add GITHUB_TOKEN as a secret environment variable (Repository Settings → Secrets)
+# 6. Deploy!
+# ================================================
+
+# After first deploy:
+# - Update the domain in the web service if you want a custom one
+# - The /update endpoint will run automatically every 6 hours via the cron job
+# - All CSV + state files are persisted on the attached disk
