@@ -1,35 +1,22 @@
 # render.yaml
-# ERM v9.1 – TWO services: FastAPI backend + Streamlit dashboard
+# ERM v9.1 — GitHub-only persistence (no Render disk)
 services:
-  # ==================== FASTAPI BACKEND ====================
+  # ==================== FASTAPI BACKEND (main service) ====================
   - type: web
-    name: erm-backend
+    name: erm-live
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"   # ← fixed: main:app
+    startCommand: "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
+    
     envVars:
       - key: GITHUB_TOKEN
         sync: false
       - key: GITHUB_REPO
-        sync: false
+        sync: false               # e.g. "yourusername/erm-live-data"
       - key: PYTHON_VERSION
         value: "3.12"
+    
     healthCheckPath: "/health"
     autoDeploy: true
-    disk:
-      name: erm-data
-      mountPath: /opt/render/project/src/ERM_Data
-      sizeGB: 1
-
-  # ==================== STREAMLIT DASHBOARD ====================
-  - type: web
-    name: erm-dashboard
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
-    envVars:
-      - key: BACKEND_URL
-        value: "https://erm-backend.onrender.com"   # ← points to the backend service
-    autoDeploy: true
+    # ← NO disk section anymore
