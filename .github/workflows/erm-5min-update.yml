@@ -2,18 +2,18 @@ name: ERM 5-Minute Update Trigger
 
 on:
   schedule:
-    - cron: '*/10 * * * *'     # Every 10 minutes
-  workflow_dispatch:          # You can also click "Run workflow" manually
+    - cron: '*/5 * * * *'     # Every 5 minutes (keeps Render warm + triggers data refresh)
+  workflow_dispatch:          # Manual trigger from GitHub UI
 
 jobs:
   trigger-update:
     runs-on: ubuntu-latest
-    timeout-minutes: 5          # generous timeout for Render cold starts
+    timeout-minutes: 5
 
     steps:
       - name: Ping ERM /update endpoint
         run: |
-          echo "🚀 Triggering ERM update - $(date -u)"
+          echo "🚀 Triggering ERM update - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           curl -v --fail --location \
                --max-time 120 \
                --retry 3 \
@@ -21,4 +21,4 @@ jobs:
                --retry-max-time 180 \
                ${{ secrets.BACKEND_URL }}/update \
                -H "User-Agent: ERM-GitHub-Action/1.0"
-          echo "✅ Update ping completed"
+          echo "✅ Update ping completed successfully"
