@@ -31,7 +31,6 @@ unit_choice = st.sidebar.radio(
 st.session_state.unit = "F" if "F" in unit_choice else "C"
 
 def convert_temp(c: Optional[float]) -> str:
-    """Safely convert temperature with proper None handling."""
     if c is None:
         return "N/A"
     return f"{round((c * 9/5) + 32, 1)}" if st.session_state.unit == "F" else f"{round(c, 1)}"
@@ -59,15 +58,22 @@ st.sidebar.caption("ERM v9.1 • Self-Evolving Truth Detector")
 
 st.sidebar.markdown("### How the Truth Detector works")
 st.sidebar.info(
-    "• Regime-aware forecasting (learned, not hardcoded)\n"
-    "• Real baseline competition (persistence, linear reg, SMA)\n"
-    "• Multi-horizon validation + per-horizon confidence\n"
-    "• Bidirectional neighbor feedback learning\n"
-    "• Self-optimization & evolutionary model selection\n"
+    "• Regime-aware forecasting\n"
+    "• Real baseline competition\n"
+    "• Multi-horizon validation\n"
+    "• Neighbor feedback learning\n"
     "• Live matplotlib dashboard"
 )
 
-# ===================== FETCH HELPERS (optimized caching) =====================
+# ===================== DEFAULT CITIES (copied from backend) =====================
+DEFAULT_CITIES = [
+    "Columbus_OH", "Miami_FL", "New_York_NY", "Los_Angeles_CA", "London_UK",
+    "Tokyo_JP", "Pataskala_OH", "Cleveland_OH", "Fort_Lauderdale_FL",
+    "West_Palm_Beach_FL", "Philadelphia_PA", "Boston_MA", "San_Diego_CA",
+    "San_Francisco_CA", "Manchester_UK", "Birmingham_UK", "Yokohama_JP", "Osaka_JP"
+]
+
+# ===================== FETCH HELPERS =====================
 @st.cache_data(ttl=refresh_interval, show_spinner=False)
 def fetch_predict(url: str, city: str):
     try:
@@ -101,12 +107,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ===================== CITY SELECTOR =====================
-if "city_options" not in st.session_state:
-    st.session_state.city_options = DEFAULT_CITIES  # fallback list from backend
-
 selected_city = st.selectbox(
     "🌍 Select City",
-    options=st.session_state.city_options,
+    options=DEFAULT_CITIES,
     index=0,
     key="city_selector"
 )
@@ -138,7 +141,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.subheader("1. Reality vs Prediction")
     if not selected_city:
-        st.info("👆 Select a city above to see live predictions")
+        st.info("👆 Select a city above")
     else:
         pred_data = fetch_predict(backend_url, selected_city)
 
@@ -152,7 +155,6 @@ with tab1:
             confidence = pred_data.get("confidence_percent", "N/A") if pred_data else "N/A"
             st.metric("Prediction Confidence", f"{confidence}%")
 
-        # Full-horizon table
         if pred_data and "future_forecast" in pred_data:
             horizons = ["1h", "3h", "6h", "12h", "24h"]
             preds = [pred_data["future_forecast"].get(int(h[:-1])) for h in horizons]
@@ -167,11 +169,9 @@ with tab1:
             st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
         # Snapshot chart
-        live_c = None  # will be populated once /latest is added
         pred_c = pred_data.get("next_predicted_1h") if pred_data else None
-
         fig = make_subplots(rows=1, cols=1)
-        fig.add_trace(go.Scatter(x=[1], y=[live_c or 0], mode="markers+text", name="Actual", text="Actual", marker=dict(color="#00ff88", size=18)))
+        fig.add_trace(go.Scatter(x=[1], y=[0], mode="markers+text", name="Actual", text="Actual", marker=dict(color="#00ff88", size=18)))
         fig.add_trace(go.Scatter(x=[2], y=[pred_c or 0], mode="markers+text", name="ERM", text="ERM", marker=dict(color="#ffaa00", size=18)))
         fig.update_layout(title="Reality vs ERM Prediction (Snapshot)", xaxis=dict(showticklabels=False), yaxis_title=f"Temperature ({unit_symbol()})", height=400)
         st.plotly_chart(fig, use_container_width=True)
