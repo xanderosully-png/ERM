@@ -9,7 +9,7 @@ import numpy as np
 st.set_page_config(page_title="ERM v9.1 — Truth Detector", layout="wide", page_icon="🌍")
 
 st.sidebar.header("🔧 Truth Detector Controls")
-backend_url = st.sidebar.text_input("Backend URL", value="https://erm-live.onrender.com")
+backend_url = st.sidebar.text_input("Backend URL", value="https://ermforecast.onrender.com")
 refresh_interval = st.sidebar.slider("Auto-refresh (seconds)", 30, 300, 60)
 
 st.sidebar.markdown("---")
@@ -117,7 +117,7 @@ with tab1:
         if pred_data and "future_forecast" in pred_data:
             horizons = ["1h", "3h", "6h", "12h", "24h"]
             preds = [pred_data.get("future_forecast", {}).get(int(h[:-1]), None) for h in horizons]
-            confs = [pred_data.get("confidence_percent", None)] * len(horizons)  # same confidence for demo
+            confs = [pred_data.get("confidence_percent", None)] * len(horizons)
             df_pred = pd.DataFrame({"Horizon": horizons, "Prediction (°F)": preds, "Confidence (%)": confs})
             st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
@@ -130,7 +130,7 @@ with tab1:
 
 with tab2:
     st.subheader("2. Error Evolution")
-    st.info("Historical error data (MAE, RMSE) will appear automatically after several /update cycles. Multi-horizon validation is now active in v9.1.")
+    st.info("Historical error data (MAE, RMSE) will appear automatically after several /update cycles.")
 
 with tab3:
     st.subheader("3. Diagnostics")
@@ -139,7 +139,6 @@ with tab3:
         if pred_data:
             st.metric("Current Regime", pred_data.get("current_regime", "N/A"))
             st.metric("Performance Score", f"{pred_data.get('performance_score', 'N/A')}")
-            st.metric("Neighbor Influence", f"{pred_data.get('neighbor_factor', 'N/A')}")
     else:
         st.info("Select a city above")
 
