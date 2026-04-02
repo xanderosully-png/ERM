@@ -19,6 +19,6 @@ jobs:
                --retry 3 \
                --retry-delay 10 \
                --retry-max-time 180 \
-               https://ermforecast.onrender.com/update \
+               ${{ secrets.BACKEND_URL }}/update \
                -H "User-Agent: ERM-GitHub-Action/1.0"
           echo "✅ Update ping completed"
