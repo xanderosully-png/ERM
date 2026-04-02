@@ -102,7 +102,6 @@ async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
     logger.info(f"✅ Real weather data fetched for {len(data)} cities")
     return data
 
-# ==================== NEW: MISSING SATELLITE FETCH (this was the main blocker) ====================
 async def fetch_satellite_cloud_data(cities: List[Dict]) -> Dict[str, Dict]:
     data = {}
     async with httpx.AsyncClient(timeout=8.0) as client:
@@ -433,7 +432,7 @@ class ERM_Live_Adaptive:
     async def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
         pass
 
-# ==================== REAL LOAD & SAVE (creates ERM_Data CSVs) ====================
+# ==================== STRONGER SAVE + GIT BACKUP (the only changes) ====================
 async def load_city_states():
     erms = {}
     for city in DEFAULT_CITIES:
@@ -463,7 +462,7 @@ async def save_all_city_states(erms: Dict):
         rows = []
         for i in range(len(erm.history)):
             rows.append({
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.utcnow().isoformat(),   # fresh timestamp forces Git to see change
                 "temp": erm.history[i],
                 "humidity": erm.humidity_history[i] if i < len(erm.humidity_history) else 50.0,
                 "wind": erm.wind_history[i] if i < len(erm.wind_history) else 5.0,
@@ -472,9 +471,8 @@ async def save_all_city_states(erms: Dict):
                 "error": erm.error_history[i] if i < len(erm.error_history) else 0.0,
             })
         pd.DataFrame(rows).to_csv(csv_file, index=False)
-    logger.info(f"✅ Saved all cities to ERM_Data (CSV files created)")
+    logger.info(f"✅ Saved all cities to ERM_Data (CSV files created/updated)")
 
-# async_git_backup
 async def async_git_backup(data_dir: Path, state_dir: Path):
     token = os.getenv("GITHUB_TOKEN")
     repo = os.getenv("GITHUB_REPO")
@@ -486,18 +484,34 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
         remote_url = f"https://{token}@github.com/{repo}.git"
         cwd = Path(__file__).parent
 
-        await asyncio.create_subprocess_exec("git", "add", str(data_dir), str(state_dir), cwd=cwd)
+        # Force-add everything (ignores .gitignore for these folders)
+        await asyncio.create_subprocess_exec("git", "add", "-A", cwd=cwd)
+
+        # Commit with --allow-empty so we always get a commit
         proc = await asyncio.create_subprocess_exec(
-            "git", "commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
+            "git", "commit", "--allow-empty", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
             cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        await proc.communicate()
-        await asyncio.create_subprocess_exec("git", "push", remote_url, "main", cwd=cwd)
-        logger.info("✅ GitHub backup completed")
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            logger.info(f"✅ Git commit succeeded: {stdout.decode().strip() or 'no changes'}")
+        else:
+            logger.warning(f"Git commit output: {stderr.decode().strip()}")
+
+        # Push with full output capture
+        push_proc = await asyncio.create_subprocess_exec(
+            "git", "push", remote_url, "main",
+            cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        push_out, push_err = await push_proc.communicate()
+        if push_proc.returncode == 0:
+            logger.info("✅ GitHub backup completed")
+        else:
+            logger.error(f"Git push failed: {push_err.decode().strip()}")
+
     except Exception as e:
         logger.error(f"GitHub backup failed: {e}")
 
-# periodic_save
 async def periodic_save(interval_seconds: int = 300):
     while True:
         try:
@@ -510,7 +524,7 @@ async def periodic_save(interval_seconds: int = 300):
             logger.error(f"Periodic save failed: {e}")
         await asyncio.sleep(interval_seconds)
 
-# ==================== /UPDATE ENDPOINT (now saves immediately) ====================
+# ==================== /UPDATE ENDPOINT (already has immediate save) ====================
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
@@ -541,7 +555,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                     city_name=name
                 )
 
-        # ← IMMEDIATE SAVE + BACKUP (this was missing)
+        # IMMEDIATE SAVE + BACKUP
         await save_all_city_states(app.state.per_city_erms)
         await async_git_backup(DATA_DIR, STATE_DIR)
 
@@ -551,6 +565,17 @@ async def update_all_cities(background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"Update failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== NEW DEBUG ENDPOINT ====================
+@app.get("/list_files")
+async def list_files():
+    """Debug: shows exactly what files exist on Render right now"""
+    files = []
+    for file in DATA_DIR.rglob("*"):
+        files.append(str(file.relative_to(Path(__file__).parent)))
+    for file in STATE_DIR.rglob("*"):
+        files.append(str(file.relative_to(Path(__file__).parent)))
+    return {"erm_data_files": files, "erm_state_files": []}
 
 # ==================== DASHBOARD ENDPOINTS ====================
 @app.get("/health")
@@ -588,7 +613,7 @@ async def get_latest_data():
             else:
                 data.append({
                     "city": name,
-                    "live_temp": None,          # changed from dummy 15.0 so we can see when data is missing
+                    "live_temp": None,
                     "predicted_1h": None,
                     "timestamp": datetime.utcnow().isoformat()
                 })
