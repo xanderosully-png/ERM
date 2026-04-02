@@ -231,7 +231,7 @@ DEFAULT_CITIES = [
 
 http_client: Optional[httpx.AsyncClient] = None
 
-# ==================== ERM CLASS v9.0 (FULL METHODS) ====================
+# ==================== ERM CLASS v9.0 ====================
 class ERM_Live_Adaptive:
     def __init__(self, history_size: int = 20, debug_mode: bool = False):
         self.history_size = history_size
@@ -404,14 +404,46 @@ class ERM_Live_Adaptive:
     async def predict_future(self, steps_list: List[int] = [1, 3, 6, 12, 24, 48]) -> Dict[int, float]:
         pass
 
-# ==================== STUBS ====================
+# ==================== REAL LOAD & SAVE (creates ERM_Data CSVs) ====================
 async def load_city_states():
-    logger.warning("Using stub load_city_states")
-    return {city["name"]: ERM_Live_Adaptive() for city in DEFAULT_CITIES}
+    erms = {}
+    for city in DEFAULT_CITIES:
+        name = city["name"]
+        csv_file = DATA_DIR / f"{CSV_PREFIX}_{name}.csv"
+        erm = ERM_Live_Adaptive()
 
-async def save_all_city_states(erms: dict):
-    logger.info("Stub save_all_city_states called")
-    return
+        if csv_file.exists():
+            try:
+                df = pd.read_csv(csv_file)
+                for _, row in df.iterrows():
+                    erm.history.append(row["temp"])
+                    erm.humidity_history.append(row.get("humidity", 50.0))
+                    erm.wind_history.append(row.get("wind", 5.0))
+                    erm.pressure_history.append(row.get("pressure", 1013.0))
+                    erm.Er_history.append(row.get("Er", 0.0))
+                    erm.error_history.append(row.get("error", 0.0))
+                logger.info(f"Loaded {len(df)} records for {name}")
+            except Exception as e:
+                logger.warning(f"Failed to load {name}: {e}")
+        erms[name] = erm
+    return erms
+
+async def save_all_city_states(erms: Dict):
+    for name, erm in erms.items():
+        csv_file = DATA_DIR / f"{CSV_PREFIX}_{name}.csv"
+        rows = []
+        for i in range(len(erm.history)):
+            rows.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "temp": erm.history[i],
+                "humidity": erm.humidity_history[i] if i < len(erm.humidity_history) else 50.0,
+                "wind": erm.wind_history[i] if i < len(erm.wind_history) else 5.0,
+                "pressure": erm.pressure_history[i] if i < len(erm.pressure_history) else 1013.0,
+                "Er": erm.Er_history[i] if i < len(erm.Er_history) else 0.0,
+                "error": erm.error_history[i] if i < len(erm.error_history) else 0.0,
+            })
+        pd.DataFrame(rows).to_csv(csv_file, index=False)
+    logger.info(f"✅ Saved all cities to ERM_Data (CSV files created)")
 
 # async_git_backup
 async def async_git_backup(data_dir: Path, state_dir: Path):
