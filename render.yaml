@@ -1,30 +1,35 @@
 # render.yaml
-# Updated for ERM v9.1 (git backup + visualizations)
-# Just add this file (or replace your existing one) — Render will detect it automatically
-
+# ERM v9.1 – TWO services: FastAPI backend + Streamlit dashboard
 services:
+  # ==================== FASTAPI BACKEND ====================
   - type: web
-    name: erm-live
+    name: erm-backend
     env: python
-    plan: free                  # ← change to "starter" or "pro" if you upgraded
+    plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m uvicorn app:main --host 0.0.0.0 --port $PORT"
-    
-    # === NEW: Environment variables for async_git_backup ===
+    startCommand: "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"   # ← fixed: main:app
     envVars:
       - key: GITHUB_TOKEN
-        sync: false               # secret — never shown in UI
+        sync: false
       - key: GITHUB_REPO
-        sync: false               # example: "yourusername/erm-live-data"
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12"
-    
-    # Optional but recommended
     healthCheckPath: "/health"
     autoDeploy: true
-    
-    # If you want persistent disk for ERM_Data / ERM_State (recommended)
     disk:
       name: erm-data
       mountPath: /opt/render/project/src/ERM_Data
       sizeGB: 1
+
+  # ==================== STREAMLIT DASHBOARD ====================
+  - type: web
+    name: erm-dashboard
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+    envVars:
+      - key: BACKEND_URL
+        value: "https://erm-backend.onrender.com"   # ← points to the backend service
+    autoDeploy: true
