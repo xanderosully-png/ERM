@@ -435,6 +435,16 @@ async def update_all_cities(background_tasks: BackgroundTasks):
             name = city["name"]
             ground = live_data.get(name, {})
 
+            # === EXPLICIT LOCAL VARIABLE CAPTURE (fixes overwriting) ===
+            ground_temp = ground.get("temp", 15.0)
+            ground_humidity = ground.get("humidity", 50.0)
+            ground_wind = ground.get("wind", 5.0)
+            ground_pressure = ground.get("pressure", 1013.0)
+            ground_rain_prob = ground.get("rain_prob", 0.0)
+            ground_cloud_cover = ground.get("cloud_cover", 30.0)
+            ground_solar = ground.get("solar", 400.0)
+            ground_wind_dir = ground.get("wind_dir", 180.0)
+
             now = datetime.now().timestamp()
             async with rate_limiter_lock:
                 if now - city_last_request.get(name, 0) < RATE_LIMIT_WINDOW:
@@ -443,22 +453,22 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                 city_last_request[name] = now
 
             neighbors = get_neighbors(name, DEFAULT_CITIES)
-            neighbor_influence = sum(neighbor_weight_enhanced(name, n, DEFAULT_CITIES, ground.get("wind_dir", 180.0)) for n in neighbors)
+            neighbor_influence = sum(neighbor_weight_enhanced(name, n, DEFAULT_CITIES, ground_wind_dir) for n in neighbors)
 
             erm = app.state.per_city_erms.get(name)
             if erm:
                 step_tasks.append(
                     erm.step(
-                        current_temp=ground.get("temp", 15.0),
-                        current_humidity=ground.get("humidity", 50.0),
-                        current_wind=ground.get("wind", 5.0),
-                        current_pressure=ground.get("pressure", 1013.0),
-                        current_rain_prob=ground.get("rain_prob", 0.0),
-                        current_cloud_cover=ground.get("cloud_cover", 30.0),
-                        current_solar=ground.get("solar", 400.0),
-                        current_wind_dir=ground.get("wind_dir", 180.0),
-                        satellite_cloud_cover=ground.get("cloud_cover", 30.0),
-                        satellite_radiation=ground.get("solar", 400.0),
+                        current_temp=ground_temp,
+                        current_humidity=ground_humidity,
+                        current_wind=ground_wind,
+                        current_pressure=ground_pressure,
+                        current_rain_prob=ground_rain_prob,
+                        current_cloud_cover=ground_cloud_cover,
+                        current_solar=ground_solar,
+                        current_wind_dir=ground_wind_dir,
+                        satellite_cloud_cover=ground_cloud_cover,
+                        satellite_radiation=ground_solar,
                         hour_of_day=datetime.now().hour,
                         local_avg_temp=city.get("local_avg_temp", 15.0),
                         neighbor_influence=neighbor_influence,
