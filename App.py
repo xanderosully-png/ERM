@@ -56,15 +56,6 @@ refresh_interval = st.sidebar.slider(
 st.sidebar.markdown("---")
 st.sidebar.caption("ERM v9.1 • Self-Evolving Truth Detector")
 
-st.sidebar.markdown("### How the Truth Detector works")
-st.sidebar.info(
-    "• Regime-aware forecasting\n"
-    "• Real baseline competition\n"
-    "• Multi-horizon validation\n"
-    "• Neighbor feedback learning\n"
-    "• Live matplotlib dashboard"
-)
-
 # ===================== DEFAULT CITIES =====================
 DEFAULT_CITIES = [
     "Columbus_OH", "Miami_FL", "New_York_NY", "Los_Angeles_CA", "London_UK",
