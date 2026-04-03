@@ -215,6 +215,12 @@ class ERM_Live_Adaptive:
         self.error_history.append(abs(Er_new))
         self.last_predicted = next_predicted
 
+        # Update regime tracker & performance score (fixes Streamlit N/A)
+        self.regime_tracker[self.current_regime]["count"] += 1
+        if abs(Er_new) < 3.0:  # simple success threshold
+            self.regime_tracker[self.current_regime]["success"] += 1
+        self.performance_score = 0.7 * self.performance_score + 0.3 * (1.0 - abs(Er_new) / 10.0)
+
         self.nr = float(np.linalg.norm([current_temp, current_pressure, current_humidity, current_wind]))
         self.tr = solar_adjust * 0.4 + (blended_cloud / 100.0 - 0.5) * 0.3
         pressure_lag = np.mean(np.diff(list(self.pressure_history)[-5:])) if len(self.pressure_history) > 5 else 0.0
@@ -245,7 +251,6 @@ class ERM_Live_Adaptive:
             return "stable"
         return "seasonal"
 
-    # NEW: predict_future for /predict endpoint
     def predict_future(self, horizons: List[int] = [1, 3, 6, 12, 24]) -> Dict[str, Any]:
         if self.last_predicted is None or len(self.history) == 0:
             return {"error": "Not enough data yet"}
@@ -329,7 +334,7 @@ async def save_all_city_states(erms: Dict):
                 logger.error(f"❌ Failed to save {name}: {e}")
     await async_git_backup(DATA_DIR, STATE_DIR)
 
-# ===================== ROBUST GIT BACKUP =====================
+# ===================== ROBUST GIT BACKUP (FIXED) =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
     async with git_backup_lock:
         token = os.getenv("GITHUB_TOKEN")
@@ -337,10 +342,13 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
         if not token or not repo:
             logger.warning("⚠️ GITHUB_TOKEN or GITHUB_REPO not set in Render environment — skipping git backup")
             return
+        cwd = Path(__file__).parent
+        # FIX: Set git identity so Render can commit
+        await asyncio.create_subprocess_exec("git", "config", "--global", "user.email", "erm-bot@render.com", cwd=cwd)
+        await asyncio.create_subprocess_exec("git", "config", "--global", "user.name", "ERM Render Bot", cwd=cwd)
         for attempt in range(3):
             try:
                 remote_url = f"https://{token}@github.com/{repo}.git"
-                cwd = Path(__file__).parent
                 await asyncio.create_subprocess_exec("git", "add", str(data_dir), cwd=cwd)
                 proc = await asyncio.create_subprocess_exec(
                     "git", "commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
@@ -441,7 +449,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# NEW: Data retrieval endpoints for Streamlit
+# Data retrieval for Streamlit
 @app.get("/latest/{city}")
 async def get_latest(city: str):
     erm = app.state.per_city_erms.get(city)
@@ -465,7 +473,7 @@ async def get_predict(city: str):
     logger.info(f"📡 /predict requested for {city}")
     return erm.predict_future()
 
-# ENHANCED: Full visualization dashboard
+# Enhanced visualization (already working)
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
     erm = app.state.per_city_erms.get(city)
