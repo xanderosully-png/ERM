@@ -1,7 +1,7 @@
 # render.yaml
-# ERM v9.1 — GitHub-only persistence (no Render disk)
+# ERM v9.1 — GitHub-only persistence (in-app git backup + safety Action)
+
 services:
-  # ==================== FASTAPI BACKEND (main service) ====================
   - type: web
     name: erm-live
     env: python
@@ -13,10 +13,10 @@ services:
       - key: GITHUB_TOKEN
         sync: false
       - key: GITHUB_REPO
-        sync: false               # e.g. "yourusername/erm-live-data"
+        sync: false               # e.g. "yourusername/erm-forecast"
       - key: PYTHON_VERSION
         value: "3.12"
     
-    healthCheckPath: "/health"
+    healthCheckPath: "/status"    # better than /health
     autoDeploy: true
-    # ← NO disk section anymore
+    # NO disk section — we use git push
