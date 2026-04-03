@@ -380,35 +380,27 @@ async def save_all_city_states(erms: Dict):
 
 # ===================== ROBUST GIT HELPER =====================
 async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
-    """Robust async git command runner with full output capture and error handling."""
     cmd = ["git"] + args
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
-
         stdout_str = stdout.decode().strip()
         stderr_str = stderr.decode().strip()
-
         if stdout_str:
             logger.debug(f"Git stdout: {stdout_str}")
         if stderr_str:
             logger.debug(f"Git stderr: {stderr_str}")
-
         if check and proc.returncode != 0:
-            error = stderr_str or stdout_str or f"Git command failed with code {proc.returncode}"
+            error = stderr_str or stdout_str or f"code {proc.returncode}"
             raise RuntimeError(f"{' '.join(cmd)} failed: {error}")
-
         return proc.returncode
     except Exception as e:
         logger.error(f"Subprocess error running {' '.join(cmd)}: {e}")
         raise
 
-# ===================== ROBUST GIT BACKUP (DOUBLE-CHECKED & FIXED) =====================
+# ===================== ROBUST GIT BACKUP =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
     async with git_backup_lock:
         token = os.getenv("GITHUB_TOKEN")
@@ -425,22 +417,18 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             await run_git_command(["config", "--global", "user.name", "ERM Render Bot"], cwd)
 
             remote_url = f"https://{token}@github.com/{repo}.git"
-
             await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
             await run_git_command(["remote", "add", "origin", remote_url], cwd, check=False)
 
             logger.info("🔄 Pulling latest changes with rebase...")
             await run_git_command(["pull", "origin", "main", "--rebase"], cwd)
 
-            logger.info(f"📁 Staging files from {data_dir} and {state_dir}...")
+            logger.info(f"📁 Staging files from {data_dir}...")
             await run_git_command(["add", "-A"], cwd)
 
-            # === DOUBLE-CHECKED CHANGE DETECTION ===
             proc = await asyncio.create_subprocess_exec(
                 "git", "diff", "--cached", "--name-only",
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
             stdout, _ = await proc.communicate()
             changed_files = stdout.decode().strip()
