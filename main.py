@@ -186,6 +186,7 @@ class ERM_Live_Adaptive:
         diffs = np.diff(recent_t)
         volatility = float(np.std(self.history)) if len(self.history) > 1 else 0.0
 
+        # Dynamic satellite (no longer hardcoded)
         sat_weight = 0.65 if satellite_radiation > 50 else 0.35
         blended_cloud = current_cloud_cover * (1 - sat_weight) + satellite_cloud_cover * sat_weight
         solar_adjust = np.clip((satellite_radiation - 300) / 800.0, -0.8, 1.2)
@@ -197,14 +198,32 @@ class ERM_Live_Adaptive:
         sat_forcing = solar_adjust * 0.4 + (blended_cloud / 100.0 - 0.5) * 0.3
         regime_damp = 0.8 if self.current_regime in ["storm", "chaotic"] else 1.0
 
-        Er_new = (short_trend + sat_forcing + neighbor_influence) * self.alpha * regime_damp
+        # Empirical term
+        empirical_term = (short_trend + sat_forcing + neighbor_influence) * self.alpha * regime_damp
+        empirical_term = np.clip(empirical_term, -8.0, 8.0)
+
+        # FULL ERM PHYSICS TERM (now driving the model)
+        self.nr = float(np.linalg.norm([current_temp, current_pressure, current_humidity, current_wind]))
+        self.tr = solar_adjust * 0.4 + (blended_cloud / 100.0 - 0.5) * 0.3
+        pressure_lag = np.mean(np.diff(list(self.pressure_history)[-5:])) if len(self.pressure_history) > 5 else 0.0
+        humidity_lag = np.mean(np.diff(list(self.humidity_history)[-5:])) if len(self.humidity_history) > 5 else 0.0
+        wind_lag = current_wind_dir - 180.0
+        self.delta_phi = pressure_lag
+        self.delta_phi_multi = 0.6 * pressure_lag + 0.3 * humidity_lag + 0.1 * (wind_lag / 180.0)
+        self.delta_phi_history.append(self.delta_phi_multi)
+
+        beta = self.gamma * (1.0 - self.lambda_damp * volatility / 10.0)
+        beta = np.clip(beta, 0.4, 1.2)
+        self.k = beta
+
+        physics_term = (self.nr * self.tr * self.delta_phi_multi) / (self.k + 1e-6)
+
+        # Blend 60% physics + 40% empirical (true ERM behavior)
+        Er_new = 0.6 * physics_term + 0.4 * empirical_term
         Er_new = np.clip(Er_new, -8.0, 8.0)
 
         self.smoothed_er = 0.7 * Er_new + 0.3 * self.smoothed_er
         Er_new = self.smoothed_er
-
-        beta = self.gamma * (1.0 - self.lambda_damp * volatility / 10.0)
-        beta = np.clip(beta, 0.4, 1.2)
 
         next_predicted = current_temp + (Er_new * beta)
         next_predicted = np.clip(next_predicted, current_temp - 50, current_temp + 50)
@@ -219,16 +238,6 @@ class ERM_Live_Adaptive:
         if abs(Er_new) < 3.0:
             self.regime_tracker[self.current_regime]["success"] += 1
         self.performance_score = 0.7 * self.performance_score + 0.3 * (1.0 - abs(Er_new) / 10.0)
-
-        self.nr = float(np.linalg.norm([current_temp, current_pressure, current_humidity, current_wind]))
-        self.tr = solar_adjust * 0.4 + (blended_cloud / 100.0 - 0.5) * 0.3
-        pressure_lag = np.mean(np.diff(list(self.pressure_history)[-5:])) if len(self.pressure_history) > 5 else 0.0
-        humidity_lag = np.mean(np.diff(list(self.humidity_history)[-5:])) if len(self.humidity_history) > 5 else 0.0
-        wind_lag = current_wind_dir - 180.0
-        self.delta_phi = pressure_lag
-        self.delta_phi_multi = 0.6 * pressure_lag + 0.3 * humidity_lag + 0.1 * (wind_lag / 180.0)
-        self.delta_phi_history.append(self.delta_phi_multi)
-        self.k = beta
 
         if abs(Er_new) > 6.0:
             logger.warning(f"⚠️ Extreme Er_new detected: {Er_new:.2f} (regime: {self.current_regime})")
@@ -335,6 +344,8 @@ async def save_all_city_states(erms: Dict):
 
 # ===================== ROBUST GIT BACKUP =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
+    # NOTE: Git backup works for now but is risky in production (can hang, token exposure in logs).
+    # Future upgrade recommendation: replace with S3 upload or background queue.
     async with git_backup_lock:
         token = os.getenv("GITHUB_TOKEN")
         repo = os.getenv("GITHUB_REPO")
@@ -402,11 +413,9 @@ async def status():
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
         logger.info("🚀 Starting full /update cycle — ALL cities fetched and stepped in parallel")
-        
         live_data = await fetch_multi_variable_data(DEFAULT_CITIES)
         logger.info(f"✅ Received live data for {len(live_data)} cities")
 
-        # PARALLEL STEP — fixed variable capture
         step_tasks = []
         for city in DEFAULT_CITIES:
             name = city["name"]
@@ -424,7 +433,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
 
             erm = app.state.per_city_erms.get(name)
             if erm:
-                # Explicit capture to prevent loop variable bug
                 step_tasks.append(
                     erm.step(
                         current_temp=ground.get("temp", 15.0),
