@@ -65,7 +65,7 @@ st.sidebar.info(
     "• Live matplotlib dashboard"
 )
 
-# ===================== DEFAULT CITIES (copied from backend) =====================
+# ===================== DEFAULT CITIES =====================
 DEFAULT_CITIES = [
     "Columbus_OH", "Miami_FL", "New_York_NY", "Los_Angeles_CA", "London_UK",
     "Tokyo_JP", "Pataskala_OH", "Cleveland_OH", "Fort_Lauderdale_FL",
@@ -75,13 +75,18 @@ DEFAULT_CITIES = [
 
 # ===================== FETCH HELPERS =====================
 @st.cache_data(ttl=refresh_interval, show_spinner=False)
+def fetch_latest(url: str, city: str):
+    try:
+        r = requests.get(f"{url}/latest/{city}", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+@st.cache_data(ttl=refresh_interval, show_spinner=False)
 def fetch_predict(url: str, city: str):
     try:
-        r = requests.get(
-            f"{url}/predict/{city}",
-            params={"steps": "1,3,6,12,24"},
-            timeout=10
-        )
+        r = requests.get(f"{url}/predict/{city}", timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -143,21 +148,25 @@ with tab1:
     if not selected_city:
         st.info("👆 Select a city above")
     else:
+        latest = fetch_latest(backend_url, selected_city)
         pred_data = fetch_predict(backend_url, selected_city)
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Current Actual Temperature", f"{convert_temp(None)} {unit_symbol()}")  # placeholder until /latest is added
+            current_temp = latest.get("current_temp") if latest else None
+            st.metric("Current Actual Temperature", f"{convert_temp(current_temp)} {unit_symbol()}")
         with col2:
-            pred_display = convert_temp(pred_data.get("next_predicted_1h") if pred_data else None)
+            one_hour_pred = pred_data.get("predictions", {}).get("1h") if pred_data and "predictions" in pred_data else None
+            pred_display = convert_temp(one_hour_pred)
             st.metric("ERM 1‑Hour Prediction", f"{pred_display} {unit_symbol()}")
         with col3:
-            confidence = pred_data.get("confidence_percent", "N/A") if pred_data else "N/A"
+            confidence = pred_data.get("confidence", "N/A") if pred_data else "N/A"
             st.metric("Prediction Confidence", f"{confidence}%")
 
-        if pred_data and "future_forecast" in pred_data:
+        # Multi-horizon table
+        if pred_data and "predictions" in pred_data:
             horizons = ["1h", "3h", "6h", "12h", "24h"]
-            preds = [pred_data["future_forecast"].get(int(h[:-1])) for h in horizons]
+            preds = [pred_data["predictions"].get(h) for h in horizons]
             preds_display = [convert_temp(p) for p in preds]
             confs = [confidence] * len(horizons)
 
@@ -169,10 +178,11 @@ with tab1:
             st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
         # Snapshot chart
-        pred_c = pred_data.get("next_predicted_1h") if pred_data else None
         fig = make_subplots(rows=1, cols=1)
-        fig.add_trace(go.Scatter(x=[1], y=[0], mode="markers+text", name="Actual", text="Actual", marker=dict(color="#00ff88", size=18)))
-        fig.add_trace(go.Scatter(x=[2], y=[pred_c or 0], mode="markers+text", name="ERM", text="ERM", marker=dict(color="#ffaa00", size=18)))
+        actual = latest.get("current_temp") if latest else 0
+        pred_c = pred_data.get("predictions", {}).get("1h") if pred_data and "predictions" in pred_data else 0
+        fig.add_trace(go.Scatter(x=[1], y=[actual], mode="markers+text", name="Actual", text="Actual", marker=dict(color="#00ff88", size=18)))
+        fig.add_trace(go.Scatter(x=[2], y=[pred_c], mode="markers+text", name="ERM", text="ERM", marker=dict(color="#ffaa00", size=18)))
         fig.update_layout(title="Reality vs ERM Prediction (Snapshot)", xaxis=dict(showticklabels=False), yaxis_title=f"Temperature ({unit_symbol()})", height=400)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -183,10 +193,10 @@ with tab2:
 with tab3:
     st.subheader("3. Diagnostics")
     if selected_city:
-        pred_data = fetch_predict(backend_url, selected_city)
-        if pred_data:
-            st.metric("Current Regime", pred_data.get("current_regime", "N/A"))
-            st.metric("Performance Score", f"{pred_data.get('performance_score', 'N/A')}")
+        latest = fetch_latest(backend_url, selected_city)
+        if latest:
+            st.metric("Current Regime", latest.get("current_regime", "N/A"))
+            st.metric("Performance Score", f"{latest.get('performance_score', 'N/A')}")
         else:
             st.info("Waiting for prediction data...")
     else:
