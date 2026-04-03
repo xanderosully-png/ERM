@@ -1,15 +1,15 @@
-name: ERM Data Backup & Persist
+name: ERM Data Backup & Persist (Safety Net)
 
 on:
   schedule:
-    - cron: '*/15 * * * *'     # Every 15 minutes (after the 5-min update trigger)
-  workflow_dispatch:           # Manual trigger from GitHub UI
+    - cron: '*/30 * * * *'     # Every 30 minutes (safety net — in-app backup is primary)
+  workflow_dispatch:
 
 jobs:
   backup:
     runs-on: ubuntu-latest
     permissions:
-      contents: write           # Required for push
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -30,7 +30,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "✅ No new data to commit"
           else
-            git commit -m "📊 Auto-backup: ERM_Data CSVs $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git commit -m "📊 Safety backup: ERM_Data CSVs $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
             git push origin main
             echo "✅ Successfully pushed new ERM_Data CSVs to GitHub"
           fi
