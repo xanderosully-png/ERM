@@ -202,21 +202,35 @@ class ERM_Live_Adaptive:
         empirical_term = (short_trend + sat_forcing + neighbor_influence) * self.alpha * regime_damp
         empirical_term = np.clip(empirical_term, -8.0, 8.0)
 
-        # FULL ERM PHYSICS TERM (now driving the model)
-        self.nr = float(np.linalg.norm([current_temp, current_pressure, current_humidity, current_wind]))
+        # FULL ERM PHYSICS TERM — refined with your three critical fixes
+        # 1. Normalized Nr (critical — pressure no longer dominates)
+        self.nr = np.linalg.norm([
+            current_temp / 50.0,
+            (current_pressure - 1013.0) / 50.0,
+            current_humidity / 100.0,
+            current_wind / 20.0
+        ])
+
         self.tr = solar_adjust * 0.4 + (blended_cloud / 100.0 - 0.5) * 0.3
+
         pressure_lag = np.mean(np.diff(list(self.pressure_history)[-5:])) if len(self.pressure_history) > 5 else 0.0
         humidity_lag = np.mean(np.diff(list(self.humidity_history)[-5:])) if len(self.humidity_history) > 5 else 0.0
         wind_lag = current_wind_dir - 180.0
-        self.delta_phi = pressure_lag
-        self.delta_phi_multi = 0.6 * pressure_lag + 0.3 * humidity_lag + 0.1 * (wind_lag / 180.0)
+
+        # 2. True oscillatory phase field using sin (bounded -1 → +1)
+        self.delta_phi_multi = np.sin(
+            0.6 * pressure_lag +
+            0.3 * humidity_lag +
+            0.1 * (wind_lag / 180.0)
+        )
         self.delta_phi_history.append(self.delta_phi_multi)
 
         beta = self.gamma * (1.0 - self.lambda_damp * volatility / 10.0)
         beta = np.clip(beta, 0.4, 1.2)
         self.k = beta
 
-        physics_term = (self.nr * self.tr * self.delta_phi_multi) / (self.k + 1e-6)
+        # 3. Stabilized physics term with tanh (smooth saturation, no clipping artifacts)
+        physics_term = np.tanh((self.nr * self.tr * self.delta_phi_multi) / (self.k + 1e-6)) * 8.0
 
         # Blend 60% physics + 40% empirical (true ERM behavior)
         Er_new = 0.6 * physics_term + 0.4 * empirical_term
@@ -443,8 +457,8 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                         current_cloud_cover=ground.get("cloud_cover", 30.0),
                         current_solar=ground.get("solar", 400.0),
                         current_wind_dir=ground.get("wind_dir", 180.0),
-                        satellite_cloud_cover=30.0,
-                        satellite_radiation=300.0,
+                        satellite_cloud_cover=ground.get("cloud_cover", 30.0),
+                        satellite_radiation=ground.get("solar", 400.0),
                         hour_of_day=datetime.now().hour,
                         local_avg_temp=city.get("local_avg_temp", 15.0),
                         neighbor_influence=neighbor_influence,
