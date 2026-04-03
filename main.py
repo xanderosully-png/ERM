@@ -406,7 +406,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         live_data = await fetch_multi_variable_data(DEFAULT_CITIES)
         logger.info(f"✅ Received live data for {len(live_data)} cities")
 
-        # PARALLEL STEP — all cities at the same time
+        # PARALLEL STEP — fixed variable capture
         step_tasks = []
         for city in DEFAULT_CITIES:
             name = city["name"]
@@ -424,6 +424,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
 
             erm = app.state.per_city_erms.get(name)
             if erm:
+                # Explicit capture to prevent loop variable bug
                 step_tasks.append(
                     erm.step(
                         current_temp=ground.get("temp", 15.0),
