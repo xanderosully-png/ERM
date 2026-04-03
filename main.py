@@ -186,7 +186,6 @@ class ERM_Live_Adaptive:
         diffs = np.diff(recent_t)
         volatility = float(np.std(self.history)) if len(self.history) > 1 else 0.0
 
-        # Dynamic satellite (no longer hardcoded)
         sat_weight = 0.65 if satellite_radiation > 50 else 0.35
         blended_cloud = current_cloud_cover * (1 - sat_weight) + satellite_cloud_cover * sat_weight
         solar_adjust = np.clip((satellite_radiation - 300) / 800.0, -0.8, 1.2)
@@ -198,12 +197,9 @@ class ERM_Live_Adaptive:
         sat_forcing = solar_adjust * 0.4 + (blended_cloud / 100.0 - 0.5) * 0.3
         regime_damp = 0.8 if self.current_regime in ["storm", "chaotic"] else 1.0
 
-        # Empirical term
         empirical_term = (short_trend + sat_forcing + neighbor_influence) * self.alpha * regime_damp
         empirical_term = np.clip(empirical_term, -8.0, 8.0)
 
-        # FULL ERM PHYSICS TERM — refined with your three critical fixes
-        # 1. Normalized Nr (critical — pressure no longer dominates)
         self.nr = np.linalg.norm([
             current_temp / 50.0,
             (current_pressure - 1013.0) / 50.0,
@@ -217,7 +213,6 @@ class ERM_Live_Adaptive:
         humidity_lag = np.mean(np.diff(list(self.humidity_history)[-5:])) if len(self.humidity_history) > 5 else 0.0
         wind_lag = current_wind_dir - 180.0
 
-        # 2. True oscillatory phase field using sin (bounded -1 → +1)
         self.delta_phi_multi = np.sin(
             0.6 * pressure_lag +
             0.3 * humidity_lag +
@@ -229,10 +224,8 @@ class ERM_Live_Adaptive:
         beta = np.clip(beta, 0.4, 1.2)
         self.k = beta
 
-        # 3. Stabilized physics term with tanh (smooth saturation, no clipping artifacts)
         physics_term = np.tanh((self.nr * self.tr * self.delta_phi_multi) / (self.k + 1e-6)) * 8.0
 
-        # Blend 60% physics + 40% empirical (true ERM behavior)
         Er_new = 0.6 * physics_term + 0.4 * empirical_term
         Er_new = np.clip(Er_new, -8.0, 8.0)
 
@@ -289,12 +282,8 @@ class ERM_Live_Adaptive:
         }
 
 # ===================== LIFESPAN =====================
-http_client: Optional[httpx.AsyncClient] = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
-    http_client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_connections=15, max_keepalive_connections=8))
     for d in (DATA_DIR, STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -303,6 +292,13 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
     logger.info(f"🚀 ERM v{VERSION} started — build phase active")
     yield
+    for task in (getattr(app.state, 'save_task', None), getattr(app.state, 'cleanup_task', None)):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     logger.info(f"🛑 ERM v{VERSION} shutdown complete")
 
 app = FastAPI(title=f"ERM Live Update Service — v{VERSION}", lifespan=lifespan)
@@ -325,6 +321,11 @@ async def load_city_states() -> Dict[str, ERM_Live_Adaptive]:
                     erm.pressure_history.append(row.get("pressure", 1013.0))
                     erm.Er_history.append(row.get("Er", 0.0))
                     erm.error_history.append(row.get("error", 0.0))
+                    erm.smoothed_er = float(row.get("smoothed_er", 0.0))
+                    erm.performance_score = float(row.get("performance_score", 0.0))
+                    erm.current_regime = row.get("current_regime", "stable")
+                if len(df) > 0:
+                    erm.last_predicted = float(df.iloc[-1]["temp"])
             except Exception as e:
                 logger.error(f"Failed to load {name}: {e}")
         else:
@@ -340,6 +341,7 @@ async def save_all_city_states(erms: Dict):
             try:
                 if len(erm.history) == 0:
                     continue
+
                 row = {
                     "timestamp": datetime.utcnow().isoformat(),
                     "temp": erm.history[-1],
@@ -348,45 +350,117 @@ async def save_all_city_states(erms: Dict):
                     "pressure": erm.pressure_history[-1] if erm.pressure_history else 1013.0,
                     "Er": erm.Er_history[-1] if erm.Er_history else 0.0,
                     "error": erm.error_history[-1] if erm.error_history else 0.0,
+                    "smoothed_er": erm.smoothed_er,
+                    "performance_score": erm.performance_score,
+                    "current_regime": erm.current_regime,
                 }
-                df = pd.DataFrame([row])
-                df.to_csv(csv_file, mode='a', header=not csv_file.exists(), index=False)
-                logger.info(f"✅ Appended record for {name} (total records: {len(erm.history)})")
+
+                should_write = True
+                if csv_file.exists():
+                    try:
+                        last_df = pd.read_csv(csv_file).tail(1)
+                        if not last_df.empty:
+                            last_temp = float(last_df.iloc[0]["temp"])
+                            last_er = float(last_df.iloc[0]["Er"])
+                            if abs(last_temp - row["temp"]) < 0.1 and abs(last_er - row["Er"]) < 0.1:
+                                should_write = False
+                                logger.debug(f"⏭️ Skipped duplicate record for {name}")
+                    except Exception:
+                        pass
+
+                if should_write:
+                    df = pd.DataFrame([row])
+                    df.to_csv(csv_file, mode='a', header=not csv_file.exists(), index=False)
+                    logger.info(f"✅ Appended record for {name} (records: {len(erm.history)})")
+
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
+
     await async_git_backup(DATA_DIR, STATE_DIR)
 
-# ===================== ROBUST GIT BACKUP =====================
+# ===================== ROBUST GIT HELPER =====================
+async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
+    """Robust async git command runner with full output capture and error handling."""
+    cmd = ["git"] + args
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        stdout_str = stdout.decode().strip()
+        stderr_str = stderr.decode().strip()
+
+        if stdout_str:
+            logger.debug(f"Git stdout: {stdout_str}")
+        if stderr_str:
+            logger.debug(f"Git stderr: {stderr_str}")
+
+        if check and proc.returncode != 0:
+            error = stderr_str or stdout_str or f"Git command failed with code {proc.returncode}"
+            raise RuntimeError(f"{' '.join(cmd)} failed: {error}")
+
+        return proc.returncode
+    except Exception as e:
+        logger.error(f"Subprocess error running {' '.join(cmd)}: {e}")
+        raise
+
+# ===================== ROBUST GIT BACKUP (DOUBLE-CHECKED & FIXED) =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
-    # NOTE: Git backup works for now but is risky in production (can hang, token exposure in logs).
-    # Future upgrade recommendation: replace with S3 upload or background queue.
     async with git_backup_lock:
         token = os.getenv("GITHUB_TOKEN")
         repo = os.getenv("GITHUB_REPO")
         if not token or not repo:
-            logger.warning("⚠️ GITHUB_TOKEN or GITHUB_REPO not set in Render environment — skipping git backup")
+            logger.warning("⚠️ GITHUB_TOKEN or GITHUB_REPO not set — skipping git backup")
             return
+
         cwd = Path(__file__).parent
-        await asyncio.create_subprocess_exec("git", "config", "--global", "user.email", "erm-bot@render.com", cwd=cwd)
-        await asyncio.create_subprocess_exec("git", "config", "--global", "user.name", "ERM Render Bot", cwd=cwd)
-        for attempt in range(3):
-            try:
-                remote_url = f"https://{token}@github.com/{repo}.git"
-                await asyncio.create_subprocess_exec("git", "add", str(data_dir), cwd=cwd)
-                proc = await asyncio.create_subprocess_exec(
-                    "git", "commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}",
-                    cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode != 0:
-                    logger.error(f"Git commit failed: {stderr.decode()}")
-                await asyncio.create_subprocess_exec("git", "push", remote_url, "main", cwd=cwd)
-                logger.info("✅ GitHub backup completed")
+        logger.info(f"🔄 Starting robust git backup in {cwd}")
+
+        try:
+            await run_git_command(["config", "--global", "user.email", "erm-bot@render.com"], cwd)
+            await run_git_command(["config", "--global", "user.name", "ERM Render Bot"], cwd)
+
+            remote_url = f"https://{token}@github.com/{repo}.git"
+
+            await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
+            await run_git_command(["remote", "add", "origin", remote_url], cwd, check=False)
+
+            logger.info("🔄 Pulling latest changes with rebase...")
+            await run_git_command(["pull", "origin", "main", "--rebase"], cwd)
+
+            logger.info(f"📁 Staging files from {data_dir} and {state_dir}...")
+            await run_git_command(["add", "-A"], cwd)
+
+            # === DOUBLE-CHECKED CHANGE DETECTION ===
+            proc = await asyncio.create_subprocess_exec(
+                "git", "diff", "--cached", "--name-only",
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            changed_files = stdout.decode().strip()
+
+            if not changed_files:
+                logger.info("✅ No new changes to commit — everything up to date")
                 return
-            except Exception as e:
-                logger.warning(f"Git backup attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(2 ** attempt)
-        logger.error("❌ All git backup attempts failed")
+
+            logger.info(f"📤 Changes detected:\n{changed_files}")
+
+            commit_msg = f"🚀 Auto-save {datetime.utcnow().isoformat()}"
+            await run_git_command(["commit", "-m", commit_msg], cwd)
+
+            logger.info("🚀 Pushing to GitHub...")
+            await run_git_command(["push", "origin", "main"], cwd)
+
+            logger.info("✅ Git backup completed successfully")
+
+        except Exception as e:
+            logger.error(f"❌ Git backup failed: {e}")
 
 # ===================== PERIODIC SAVE =====================
 async def periodic_save(interval_seconds: int = 300):
@@ -435,7 +509,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
             name = city["name"]
             ground = live_data.get(name, {})
 
-            # === EXPLICIT LOCAL VARIABLE CAPTURE (fixes overwriting) ===
             ground_temp = ground.get("temp", 15.0)
             ground_humidity = ground.get("humidity", 50.0)
             ground_wind = ground.get("wind", 5.0)
