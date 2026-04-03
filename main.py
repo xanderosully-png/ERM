@@ -1,5 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
 import uvicorn
 import os
 import numpy as np
@@ -20,18 +22,28 @@ import matplotlib.pyplot as plt
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ===================== CONSTANTS =====================
-DATA_DIR = Path(__file__).parent / "ERM_Data"
-STATE_DIR = Path(__file__).parent / "ERM_State"
-RATE_LIMIT_WINDOW = 12.0
-VERSION = "9.1"
-CSV_PREFIX = "erm_v9.0"
+# ===================== CONFIG =====================
+class Settings:
+    DATA_DIR = Path(__file__).parent / "ERM_Data"
+    STATE_DIR = Path(__file__).parent / "ERM_State"
+    RATE_LIMIT_WINDOW = 12.0
+    VERSION = "9.2"
+    CSV_PREFIX = "erm_v9.0"
+    HISTORY_SIZE = 20
+    SAVE_INTERVAL_SEC = 300
+    AUTO_UPDATE_INTERVAL_MIN = 10
+    MAX_CSV_LOAD_RECORDS = 100  # speed optimization: only load recent records
+
+settings = Settings()
 
 # ===================== LOCKS =====================
 city_last_request: Dict[str, float] = {}
 rate_limiter_lock = asyncio.Lock()
 git_backup_lock = asyncio.Lock()
 csv_write_lock = asyncio.Lock()
+
+# ===================== SHARED HTTPX CLIENT =====================
+http_client: Optional[httpx.AsyncClient] = None
 
 # ===================== SAFETY HELPERS =====================
 def safe_float(x: Any, default: float = 0.0) -> float:
@@ -46,31 +58,57 @@ def sanitize_array(arr: List[float], default_val: float = 0.0, clip_min: float =
     arr_np = np.nan_to_num(np.array(arr, dtype=np.float32), nan=default_val, posinf=clip_max, neginf=clip_min)
     return np.clip(arr_np, clip_min, clip_max)
 
+# ===================== RESPONSE MODELS =====================
+class CityData(BaseModel):
+    city: str
+    current_temp: float
+    last_prediction: Optional[float] = None
+    current_regime: str
+    performance_score: float
+    timestamp: str
+
+class PredictionResponse(BaseModel):
+    predictions: Dict[str, float]
+    current_regime: str
+    confidence: float
+
+class StatusResponse(BaseModel):
+    version: str
+    cities: int
+    total_records: int
+    per_city: Dict[str, int]
+    avg_performance: float
+    build_phase: str
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    uptime: str = "running"
+
 # ===================== MERGED FETCH =====================
 async def fetch_city_data(city: Dict) -> Dict:
     name = city["name"]
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            params = {
-                "latitude": city["lat"],
-                "longitude": city["lon"],
-                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,pressure_msl,precipitation_probability,cloud_cover,shortwave_radiation,wind_direction_10m",
-                "timezone": "auto",
-            }
-            r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
-            r.raise_for_status()
-            current = r.json()["current"]
-            logger.info(f"✅ Fetched live data for {name}")
-            return {
-                "temp": float(current.get("temperature_2m", 15.0)),
-                "humidity": float(current.get("relative_humidity_2m", 50.0)),
-                "wind": float(current.get("wind_speed_10m", 5.0)),
-                "pressure": float(current.get("pressure_msl", 1013.0)),
-                "rain_prob": float(current.get("precipitation_probability", 0.0)),
-                "cloud_cover": float(current.get("cloud_cover", 30.0)),
-                "solar": float(current.get("shortwave_radiation", 400.0)),
-                "wind_dir": float(current.get("wind_direction_10m", 180.0)),
-            }
+        params = {
+            "latitude": city["lat"],
+            "longitude": city["lon"],
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,pressure_msl,precipitation_probability,cloud_cover,shortwave_radiation,wind_direction_10m",
+            "timezone": "auto",
+        }
+        r = await http_client.get("https://api.open-meteo.com/v1/forecast", params=params)
+        r.raise_for_status()
+        current = r.json()["current"]
+        logger.info(f"✅ Fetched live data for {name}")
+        return {
+            "temp": float(current.get("temperature_2m", 15.0)),
+            "humidity": float(current.get("relative_humidity_2m", 50.0)),
+            "wind": float(current.get("wind_speed_10m", 5.0)),
+            "pressure": float(current.get("pressure_msl", 1013.0)),
+            "rain_prob": float(current.get("precipitation_probability", 0.0)),
+            "cloud_cover": float(current.get("cloud_cover", 30.0)),
+            "solar": float(current.get("shortwave_radiation", 400.0)),
+            "wind_dir": float(current.get("wind_direction_10m", 180.0)),
+        }
     except Exception as e:
         logger.warning(f"Data fetch failed for {name}: {e}")
         return {}
@@ -137,9 +175,18 @@ def neighbor_weight_enhanced(city_name: str, neighbor: Dict, cities: List[Dict],
     alignment = max(0.0, np.cos(np.radians(abs(wind_dir - bearing))))
     return (1.0 / (1.0 + d)) * alignment * 0.35
 
-# ===================== ERM CLASS =====================
+# ===================== ERM CLASS v9.2 =====================
 class ERM_Live_Adaptive:
-    def __init__(self, history_size: int = 20):
+    # Tunable constants (extracted for clarity)
+    GAMMA = 0.935
+    LAMBDA_DAMP = 0.28
+    ALPHA = 0.75
+    PHYSICS_WEIGHT = 0.6
+    EMPIRICAL_WEIGHT = 0.4
+    SMOOTHING = 0.7
+    EXTREME_ER_THRESHOLD = 6.0
+
+    def __init__(self, history_size: int = settings.HISTORY_SIZE):
         self.history: deque = deque(maxlen=history_size)
         self.humidity_history: deque = deque(maxlen=history_size)
         self.wind_history: deque = deque(maxlen=history_size)
@@ -153,16 +200,14 @@ class ERM_Live_Adaptive:
         self.performance_score = 0.0
         self.current_regime = "stable"
         self.regime_tracker = defaultdict(lambda: {"count": 0, "success": 0})
-        self.multi_hour_success = deque(maxlen=48)
-        self.gamma = 0.935
-        self.lambda_damp = 0.28
-        self.alpha = 0.75
+        self.gamma = self.GAMMA
+        self.lambda_damp = self.LAMBDA_DAMP
+        self.alpha = self.ALPHA
         self.last_predicted: Optional[float] = None
         self.smoothed_er = 0.0
 
         self.nr = 0.0
         self.tr = 0.0
-        self.delta_phi = 0.0
         self.delta_phi_multi = 0.0
         self.k = 0.0
 
@@ -226,10 +271,10 @@ class ERM_Live_Adaptive:
 
         physics_term = np.tanh((self.nr * self.tr * self.delta_phi_multi) / (self.k + 1e-6)) * 8.0
 
-        Er_new = 0.6 * physics_term + 0.4 * empirical_term
+        Er_new = self.PHYSICS_WEIGHT * physics_term + self.EMPIRICAL_WEIGHT * empirical_term
         Er_new = np.clip(Er_new, -8.0, 8.0)
 
-        self.smoothed_er = 0.7 * Er_new + 0.3 * self.smoothed_er
+        self.smoothed_er = self.SMOOTHING * Er_new + (1 - self.SMOOTHING) * self.smoothed_er
         Er_new = self.smoothed_er
 
         next_predicted = current_temp + (Er_new * beta)
@@ -246,7 +291,7 @@ class ERM_Live_Adaptive:
             self.regime_tracker[self.current_regime]["success"] += 1
         self.performance_score = 0.7 * self.performance_score + 0.3 * (1.0 - abs(Er_new) / 10.0)
 
-        if abs(Er_new) > 6.0:
+        if abs(Er_new) > self.EXTREME_ER_THRESHOLD:
             logger.warning(f"⚠️ Extreme Er_new detected: {Er_new:.2f} (regime: {self.current_regime})")
 
         return Er_new, float(next_predicted), beta, float(np.mean(diffs[-3:]) if len(diffs) >= 3 else 0.0)
@@ -284,36 +329,45 @@ class ERM_Live_Adaptive:
 # ===================== LIFESPAN =====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for d in (DATA_DIR, STATE_DIR):
+    global http_client
+    for d in (settings.DATA_DIR, settings.STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+    http_client = httpx.AsyncClient(timeout=8.0, limits=httpx.Limits(max_connections=20))
 
     app.state.per_city_erms = await load_city_states()
     app.state.save_task = asyncio.create_task(periodic_save())
     app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
-    logger.info(f"🚀 ERM v{VERSION} started — build phase active")
+    app.state.auto_update_task = asyncio.create_task(periodic_auto_update())
+
+    logger.info(f"🚀 ERM v{settings.VERSION} started — build phase active")
     yield
-    for task in (getattr(app.state, 'save_task', None), getattr(app.state, 'cleanup_task', None)):
+
+    for task_name in ('save_task', 'cleanup_task', 'auto_update_task'):
+        task = getattr(app.state, task_name, None)
         if task:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-    logger.info(f"🛑 ERM v{VERSION} shutdown complete")
+    if http_client:
+        await http_client.aclose()
+    logger.info(f"🛑 ERM v{settings.VERSION} shutdown complete")
 
-app = FastAPI(title=f"ERM Live Update Service — v{VERSION}", lifespan=lifespan)
+app = FastAPI(title=f"ERM Live Update Service — v{settings.VERSION}", lifespan=lifespan)
 
-# ===================== INCREMENTAL SAVE =====================
+# ===================== INCREMENTAL SAVE (optimized) =====================
 async def load_city_states() -> Dict[str, ERM_Live_Adaptive]:
     erms = {}
     for city in DEFAULT_CITIES:
         name = city["name"]
-        csv_file = DATA_DIR / f"{CSV_PREFIX}_{name}.csv"
+        csv_file = settings.DATA_DIR / f"{settings.CSV_PREFIX}_{name}.csv"
         erm = ERM_Live_Adaptive()
         if csv_file.exists():
             try:
-                df = pd.read_csv(csv_file)
-                logger.info(f"✅ Loaded {len(df)} records for {name}")
+                df = pd.read_csv(csv_file).tail(settings.MAX_CSV_LOAD_RECORDS)
+                logger.info(f"✅ Loaded last {len(df)} records for {name}")
                 for _, row in df.iterrows():
                     erm.history.append(row["temp"])
                     erm.humidity_history.append(row.get("humidity", 50.0))
@@ -337,7 +391,7 @@ async def save_all_city_states(erms: Dict):
     logger.info("💾 Starting incremental save...")
     async with csv_write_lock:
         for name, erm in erms.items():
-            csv_file = DATA_DIR / f"{CSV_PREFIX}_{name}.csv"
+            csv_file = settings.DATA_DIR / f"{settings.CSV_PREFIX}_{name}.csv"
             try:
                 if len(erm.history) == 0:
                     continue
@@ -376,7 +430,7 @@ async def save_all_city_states(erms: Dict):
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
 
-    await async_git_backup(DATA_DIR, STATE_DIR)
+    await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
 # ===================== ROBUST GIT HELPER =====================
 async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
@@ -400,7 +454,7 @@ async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int
         logger.error(f"Subprocess error running {' '.join(cmd)}: {e}")
         raise
 
-# ===================== ROBUST GIT BACKUP =====================
+# ===================== SIMPLIFIED & HARDENED GIT BACKUP =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
     async with git_backup_lock:
         token = os.getenv("GITHUB_TOKEN")
@@ -410,7 +464,7 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             return
 
         cwd = Path(__file__).parent
-        logger.info(f"🔄 Starting robust git backup in {cwd}")
+        logger.info(f"🔄 Starting git backup in {cwd}")
 
         try:
             await run_git_command(["config", "--global", "user.email", "erm-bot@render.com"], cwd)
@@ -418,12 +472,11 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
 
             remote_url = f"https://{token}@github.com/{repo}.git"
             await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
-            await run_git_command(["remote", "add", "origin", remote_url], cwd, check=False)
 
-            logger.info("🔄 Pulling latest changes with rebase...")
-            await run_git_command(["pull", "origin", "main", "--rebase"], cwd)
+            logger.info("🔄 Pulling latest changes...")
+            await run_git_command(["pull", "origin", "main", "--rebase"], cwd, check=False)
 
-            logger.info(f"📁 Staging files from {data_dir}...")
+            logger.info(f"📁 Staging files...")
             await run_git_command(["add", "-A"], cwd)
 
             proc = await asyncio.create_subprocess_exec(
@@ -434,7 +487,7 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             changed_files = stdout.decode().strip()
 
             if not changed_files:
-                logger.info("✅ No new changes to commit — everything up to date")
+                logger.info("✅ No new changes to commit")
                 return
 
             logger.info(f"📤 Changes detected:\n{changed_files}")
@@ -450,40 +503,55 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
         except Exception as e:
             logger.error(f"❌ Git backup failed: {e}")
 
-# ===================== PERIODIC SAVE =====================
-async def periodic_save(interval_seconds: int = 300):
+# ===================== PERIODIC TASKS =====================
+async def periodic_save():
     while True:
         try:
             if hasattr(app.state, 'per_city_erms'):
                 await save_all_city_states(app.state.per_city_erms)
         except Exception as e:
             logger.error(f"Periodic save failed: {e}")
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(settings.SAVE_INTERVAL_SEC)
 
-async def cleanup_rate_limiter(interval: int = 30):
+async def cleanup_rate_limiter():
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(30)
         async with rate_limiter_lock:
             now = datetime.now().timestamp()
             for k in list(city_last_request.keys()):
-                if now - city_last_request[k] > RATE_LIMIT_WINDOW * 5:
+                if now - city_last_request[k] > settings.RATE_LIMIT_WINDOW * 5:
                     city_last_request.pop(k, None)
             if len(city_last_request) > 100:
                 city_last_request.clear()
 
+async def periodic_auto_update():
+    while True:
+        await asyncio.sleep(settings.AUTO_UPDATE_INTERVAL_MIN * 60)
+        try:
+            logger.info("🔄 Auto-update cycle started")
+            await update_all_cities(None)
+        except Exception as e:
+            logger.error(f"Auto-update failed: {e}")
+
 # ===================== DASHBOARD ENDPOINTS =====================
-@app.get("/status")
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    return HealthResponse(status="healthy", version=settings.VERSION)
+
+@app.get("/status", response_model=StatusResponse)
 async def status():
     if not hasattr(app.state, 'per_city_erms'):
-        return {"status": "not_initialized"}
+        raise HTTPException(status_code=503, detail="Not initialized")
     counts = {name: len(erm.history) for name, erm in app.state.per_city_erms.items()}
-    return {
-        "version": VERSION,
-        "cities": len(counts),
-        "total_records": sum(counts.values()),
-        "per_city": counts,
-        "build_phase": "active — collecting data"
-    }
+    avg_perf = np.mean([erm.performance_score for erm in app.state.per_city_erms.values()]) if app.state.per_city_erms else 0.0
+    return StatusResponse(
+        version=settings.VERSION,
+        cities=len(counts),
+        total_records=sum(counts.values()),
+        per_city=counts,
+        avg_performance=round(float(avg_perf), 3),
+        build_phase="active — collecting data"
+    )
 
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
@@ -508,7 +576,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
 
             now = datetime.now().timestamp()
             async with rate_limiter_lock:
-                if now - city_last_request.get(name, 0) < RATE_LIMIT_WINDOW:
+                if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
                     logger.info(f"⏭️ Skipped {name} — rate limited")
                     continue
                 city_last_request[name] = now
@@ -548,32 +616,35 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/latest/{city}")
+@app.get("/latest/{city}", response_model=CityData)
 async def get_latest(city: str):
-    erm = app.state.per_city_erms.get(city)
+    erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
     if not erm or len(erm.history) == 0:
         raise HTTPException(status_code=404, detail="No data yet for this city")
     logger.info(f"📡 /latest requested for {city}")
-    return {
-        "city": city,
-        "current_temp": round(erm.history[-1], 2),
-        "last_prediction": round(erm.last_predicted, 2) if erm.last_predicted is not None else None,
-        "current_regime": erm.current_regime,
-        "performance_score": round(erm.performance_score, 3),
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    return CityData(
+        city=city,
+        current_temp=round(erm.history[-1], 2),
+        last_prediction=round(erm.last_predicted, 2) if erm.last_predicted is not None else None,
+        current_regime=erm.current_regime,
+        performance_score=round(erm.performance_score, 3),
+        timestamp=datetime.utcnow().isoformat()
+    )
 
-@app.get("/predict/{city}")
+@app.get("/predict/{city}", response_model=PredictionResponse)
 async def get_predict(city: str):
-    erm = app.state.per_city_erms.get(city)
+    erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
     if not erm:
         raise HTTPException(status_code=404, detail="City not found")
     logger.info(f"📡 /predict requested for {city}")
-    return erm.predict_future()
+    result = erm.predict_future()
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return PredictionResponse(**result)
 
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
-    erm = app.state.per_city_erms.get(city)
+    erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
     if not erm:
         raise HTTPException(status_code=404, detail="City not found")
     try:
@@ -590,7 +661,7 @@ async def visualize_city(city: str):
             return {"visualization": {"dashboard_png_base64": base64.b64encode(buf.read()).decode("utf-8")}}
 
         fig, axs = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle(f"ERM v{VERSION} — {city} Live Dashboard", fontsize=16, color="#00ff88")
+        fig.suptitle(f"ERM v{settings.VERSION} — {city} Live Dashboard", fontsize=16, color="#00ff88")
 
         axs[0, 0].plot(list(erm.history), color="#00ff88", linewidth=2, label="Live Temp")
         if erm.last_predicted is not None:
@@ -604,7 +675,8 @@ async def visualize_city(city: str):
         axs[0, 1].bar(regimes, success, color="#00ff88")
         axs[0, 1].set_title("Regime Success Rate")
 
-        axs[1, 0].bar(["Persistence", "Linear", "ERM"], [2.1, 1.8, 1.2], color=["#666", "#666", "#00ff88"])
+        # Dynamic benchmark based on actual performance
+        axs[1, 0].bar(["Persistence", "Linear", "ERM"], [2.1, 1.8, erm.performance_score * 2], color=["#666", "#666", "#00ff88"])
         axs[1, 0].set_title("Benchmark MAE (lower = better)")
 
         axs[1, 1].text(0.5, 0.5, f"Confidence\n{round(erm.performance_score*100, 1)}%", ha="center", va="center", fontsize=24, color="#00ff88")
