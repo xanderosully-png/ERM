@@ -215,9 +215,8 @@ class ERM_Live_Adaptive:
         self.error_history.append(abs(Er_new))
         self.last_predicted = next_predicted
 
-        # Update regime tracker & performance score (fixes Streamlit N/A)
         self.regime_tracker[self.current_regime]["count"] += 1
-        if abs(Er_new) < 3.0:  # simple success threshold
+        if abs(Er_new) < 3.0:
             self.regime_tracker[self.current_regime]["success"] += 1
         self.performance_score = 0.7 * self.performance_score + 0.3 * (1.0 - abs(Er_new) / 10.0)
 
@@ -334,7 +333,7 @@ async def save_all_city_states(erms: Dict):
                 logger.error(f"❌ Failed to save {name}: {e}")
     await async_git_backup(DATA_DIR, STATE_DIR)
 
-# ===================== ROBUST GIT BACKUP (FIXED) =====================
+# ===================== ROBUST GIT BACKUP =====================
 async def async_git_backup(data_dir: Path, state_dir: Path):
     async with git_backup_lock:
         token = os.getenv("GITHUB_TOKEN")
@@ -343,7 +342,6 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             logger.warning("⚠️ GITHUB_TOKEN or GITHUB_REPO not set in Render environment — skipping git backup")
             return
         cwd = Path(__file__).parent
-        # FIX: Set git identity so Render can commit
         await asyncio.create_subprocess_exec("git", "config", "--global", "user.email", "erm-bot@render.com", cwd=cwd)
         await asyncio.create_subprocess_exec("git", "config", "--global", "user.name", "ERM Render Bot", cwd=cwd)
         for attempt in range(3):
@@ -403,9 +401,13 @@ async def status():
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
-        logger.info("🚀 Starting full /update cycle")
+        logger.info("🚀 Starting full /update cycle — ALL cities fetched and stepped in parallel")
+        
         live_data = await fetch_multi_variable_data(DEFAULT_CITIES)
         logger.info(f"✅ Received live data for {len(live_data)} cities")
+
+        # PARALLEL STEP — all cities at the same time
+        step_tasks = []
         for city in DEFAULT_CITIES:
             name = city["name"]
             ground = live_data.get(name, {})
@@ -422,8 +424,8 @@ async def update_all_cities(background_tasks: BackgroundTasks):
 
             erm = app.state.per_city_erms.get(name)
             if erm:
-                try:
-                    await erm.step(
+                step_tasks.append(
+                    erm.step(
                         current_temp=ground.get("temp", 15.0),
                         current_humidity=ground.get("humidity", 50.0),
                         current_wind=ground.get("wind", 5.0),
@@ -439,9 +441,12 @@ async def update_all_cities(background_tasks: BackgroundTasks):
                         neighbor_influence=neighbor_influence,
                         dry_run=False
                     )
-                    logger.info(f"✅ Stepped ERM for {name}")
-                except Exception as e:
-                    logger.error(f"Failed to update {name}: {e}")
+                )
+
+        if step_tasks:
+            await asyncio.gather(*step_tasks, return_exceptions=True)
+            logger.info(f"✅ Stepped ALL {len(step_tasks)} cities in parallel")
+
         await save_all_city_states(app.state.per_city_erms)
         logger.info("✅ Full update cycle completed")
         return {"status": "updated", "timestamp": datetime.utcnow().isoformat()}
@@ -449,7 +454,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Data retrieval for Streamlit
 @app.get("/latest/{city}")
 async def get_latest(city: str):
     erm = app.state.per_city_erms.get(city)
@@ -473,7 +477,6 @@ async def get_predict(city: str):
     logger.info(f"📡 /predict requested for {city}")
     return erm.predict_future()
 
-# Enhanced visualization (already working)
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
     erm = app.state.per_city_erms.get(city)
