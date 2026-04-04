@@ -11,9 +11,9 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Ping ERM /update endpoint
+      - name: Ping ERM /update endpoint (v10.1)
         run: |
-          echo "🚀 Triggering ERM update - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "🚀 Triggering ERM v10.1 update - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           curl -v --fail --location \
                --max-time 120 \
                --retry 3 \
