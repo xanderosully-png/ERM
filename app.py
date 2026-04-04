@@ -32,16 +32,22 @@ st.session_state.unit = "F" if "F" in unit_choice else "C"
 def convert_temp(c: Optional[float]) -> str:
     if c is None:
         return "N/A"
-    return f"{round((c * 9/5) + 32, 1)}" if st.session_state.unit == "F" else f"{round(c, 1)}"
+    if st.session_state.unit == "F":
+        return f"{round((c * 9/5) + 32, 1)}"
+    return f"{round(c, 1)}"
 
 def unit_symbol() -> str:
     return "°F" if st.session_state.unit == "F" else "°C"
 
-backend_url = st.sidebar.text_input(
-    "Backend URL",
-    value="https://erm-live.onrender.com",   # ← UPDATED TO YOUR NEW BACKEND
-    help="Point this to your deployed main.py service"
-)
+# ===================== BACKEND URL FROM SECRETS =====================
+try:
+    backend_url = st.secrets["BACKEND_URL"]
+except Exception:
+    backend_url = st.sidebar.text_input(
+        "Backend URL",
+        value="https://erm-live.onrender.com",
+        help="Fallback — update .streamlit/secrets.toml for production"
+    )
 
 refresh_interval = st.sidebar.slider(
     "Auto-refresh interval (seconds)",
@@ -188,7 +194,8 @@ with tab5:
 # ===================== FOOTER =====================
 st.caption(
     f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | "
-    f"Backend: v10.0 | Unit: {unit_symbol()}"
+    f"Backend: v10.0 | Unit: {unit_symbol()} | "
+    f"Connected to: {backend_url}"
 )
 
 if st.button("🔄 Hard Refresh Dashboard", use_container_width=True):
