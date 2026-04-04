@@ -39,7 +39,7 @@ def unit_symbol() -> str:
 
 backend_url = st.sidebar.text_input(
     "Backend URL",
-    value="https://ermforecast.onrender.com",
+    value="https://erm-live.onrender.com",   # ← UPDATED TO YOUR NEW BACKEND
     help="Point this to your deployed main.py service"
 )
 
