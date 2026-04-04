@@ -39,8 +39,8 @@ def unit_symbol() -> str:
 
 backend_url = st.sidebar.text_input(
     "Backend URL",
-    value="http://localhost:8000",
-    help="Point this to your main.py FastAPI backend"
+    value="https://your-main-service.onrender.com",   # ← CHANGE THIS to your actual FastAPI URL
+    help="Point this to your deployed main.py service"
 )
 
 refresh_interval = st.sidebar.slider(
@@ -86,7 +86,7 @@ def fetch_visualization(url: str, city: str):
     try:
         r = requests.get(f"{url}/visualize/{city}", timeout=15)
         r.raise_for_status()
-        return r.text  # returns full Plotly HTML
+        return r.text
     except Exception as e:
         return f"<h3 style='color:red'>Visualization error: {e}</h3>"
 
