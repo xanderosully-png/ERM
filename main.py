@@ -38,7 +38,7 @@ class Settings:
     VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
     RATE_LIMIT_WINDOW = 45.0
-    VERSION = "10.0"                                         # Phase 6 complete
+    VERSION = "10.0"
     CSV_PREFIX = "erm_v9.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
@@ -110,7 +110,7 @@ def load_cities_config() -> List[Dict]:
             return cities
         except Exception as e:
             logger.error(f"Failed to load cities.json: {e}")
-            raise  # cities.json is confirmed present — fail fast
+            raise
 
     logger.error("❌ No cities configuration found. Place cities.json in the project root or set CITIES_JSON environment variable.")
     raise FileNotFoundError("cities.json or CITIES_JSON env var is required")
@@ -294,8 +294,8 @@ async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
         data[name] = result if isinstance(result, dict) else {"temp": 15.0, "humidity": 50.0, "wind": 5.0, "pressure": 1013.0, "rain_prob": 0.0, "cloud_cover": 30.0, "solar": 400.0, "wind_dir": 180.0}
     return data
 
-# ===================== CORE UPDATE LOGIC =====================
-async def _perform_city_updates():
+# ===================== CORE UPDATE LOGIC (FIXED) =====================
+async def _perform_city_updates(force_update: bool = False):
     logger.info("🚀 Starting optimized simultaneous update cycle")
     cities = app.state.cities_config
     live_data = await fetch_multi_variable_data(cities)
@@ -308,15 +308,19 @@ async def _perform_city_updates():
         neighbors = app.state.neighbor_graph.get(name, [])
         neighbor_influences[name] = sum(neighbor_weight_enhanced(name, n, cities, wind_dir) for n in neighbors)
 
+    updated_count = 0
     for city in cities:
         name = city["name"]
         ground = live_data.get(name, {})
 
-        now = datetime.now().timestamp()
-        async with rate_limiter_lock:
-            if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
-                continue
-            city_last_request[name] = now
+        # Bypass rate limiter when manually triggered from dashboard
+        if not force_update:
+            now = datetime.now().timestamp()
+            async with rate_limiter_lock:
+                if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
+                    logger.info(f"⏭️ Rate-limited skip for {name}")
+                    continue
+                city_last_request[name] = now
 
         erm = app.state.per_city_erms.get(name)
         if not erm:
@@ -349,10 +353,17 @@ async def _perform_city_updates():
             erm.current_regime,
             temp_jump
         )
+        updated_count += 1
 
     await save_all_city_states(app.state.per_city_erms)
-    logger.info("✅ Update + anomaly tracking completed")
-    return {"status": "updated", "timestamp": datetime.utcnow().isoformat(), "model": "ERM_v3", "cities": len(cities)}
+    logger.info(f"✅ Update completed — {updated_count}/{len(cities)} cities refreshed")
+    return {
+        "status": "updated",
+        "timestamp": datetime.utcnow().isoformat(),
+        "model": "ERM_v3",
+        "cities_updated": updated_count,
+        "total_cities": len(cities)
+    }
 
 # ===================== LIFESPAN =====================
 @asynccontextmanager
@@ -408,7 +419,6 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
         if not df.empty:
             logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite (chronological order)")
 
-            # Populate raw history lists (fast load)
             for _, row in df.iterrows():
                 erm.history.append(row["temp"])
                 erm.humidity_history.append(row.get("humidity", 50.0))
@@ -423,8 +433,6 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
             if len(df) > 0:
                 erm.last_predicted = float(df.iloc[-1]["temp"])
 
-            # CRITICAL FIX: Replay full history so internal model state (regimes, smoothing, performance, etc.)
-            # is correctly restored after restart — prevents inconsistent state on first update
             try:
                 replay_result = erm.replay_history(list(erm.history))
                 logger.info(f"🔄 Replayed {replay_result['steps']} historical steps for {name} (final regime: {replay_result['final_regime']})")
@@ -474,7 +482,7 @@ async def save_all_city_states(erms: Dict):
     logger.info(f"✅ Saved {saved_count} cities to SQLite")
     await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
-# ===================== GIT BACKUP (restored + optimized) =====================
+# ===================== GIT BACKUP =====================
 async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
     cmd = ["git"] + args
     try:
@@ -504,7 +512,6 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
             await run_git_command(["pull", "origin", "main", "--rebase"], cwd, check=False)
 
-            # Only commit if there are actual changes (prevents noisy empty commits)
             await run_git_command(["add", "-A"], cwd)
             proc = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--name-only", cwd=cwd, stdout=asyncio.subprocess.PIPE)
             stdout, _ = await proc.communicate()
@@ -576,11 +583,11 @@ class HealthResponse(BaseModel):
     version: str
     uptime: str = "running"
 
-# ===================== UPDATE ENDPOINT =====================
+# ===================== UPDATE ENDPOINT (with force_update) =====================
 @app.get("/update")
-async def update_all_cities(background_tasks: BackgroundTasks):
+async def update_all_cities():
     try:
-        return await _perform_city_updates()
+        return await _perform_city_updates(force_update=True)
     except Exception as e:
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -600,7 +607,6 @@ async def backtest_city(city: str):
         raise HTTPException(status_code=404, detail="City not found")
     if len(erm.history) < 10:
         raise HTTPException(status_code=400, detail="Not enough historical data for back-testing")
-
     result = erm.replay_history(list(erm.history))
     return {
         "city": city,
@@ -618,7 +624,6 @@ async def metrics():
     total_cities = len(app.state.per_city_erms)
     total_records = sum(len(erm.history) for erm in app.state.per_city_erms.values())
     avg_perf = round(np.mean([erm.performance_score for erm in app.state.per_city_erms.values()]), 3) if total_cities > 0 else 0.0
-
     return {
         "version": settings.VERSION,
         "cities": total_cities,
