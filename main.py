@@ -38,7 +38,7 @@ class Settings:
     VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
     RATE_LIMIT_WINDOW = 45.0
-    VERSION = "9.10"
+    VERSION = "10.0"                                         # Phase 6 complete
     CSV_PREFIX = "erm_v9.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
@@ -110,28 +110,10 @@ def load_cities_config() -> List[Dict]:
             return cities
         except Exception as e:
             logger.error(f"Failed to load cities.json: {e}")
+            raise  # cities.json is confirmed present — fail fast
 
-    logger.warning("⚠️ Using built-in fallback (18 cities)")
-    return [
-        {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
-        {"name": "Miami_FL", "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
-        {"name": "New_York_NY", "lat": 40.7128, "lon": -74.0060, "tz": "America/New_York", "local_avg_temp": 12.0, "local_temp_range": 32.0},
-        {"name": "Los_Angeles_CA", "lat": 34.0522, "lon": -118.2437, "tz": "America/Los_Angeles", "local_avg_temp": 18.0, "local_temp_range": 20.0},
-        {"name": "London_UK", "lat": 51.5074, "lon": -0.1278, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
-        {"name": "Tokyo_JP", "lat": 35.6895, "lon": 139.6917, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 28.0},
-        {"name": "Pataskala_OH", "lat": 39.9956, "lon": -82.6743, "tz": "America/New_York", "local_avg_temp": 12.5, "local_temp_range": 22.0},
-        {"name": "Cleveland_OH", "lat": 41.4993, "lon": -81.6944, "tz": "America/New_York", "local_avg_temp": 10.5, "local_temp_range": 19.0},
-        {"name": "Fort_Lauderdale_FL", "lat": 26.1224, "lon": -80.1373, "tz": "America/New_York", "local_avg_temp": 25.5, "local_temp_range": 14.0},
-        {"name": "West_Palm_Beach_FL", "lat": 26.7153, "lon": -80.0534, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
-        {"name": "Philadelphia_PA", "lat": 39.9526, "lon": -75.1652, "tz": "America/New_York", "local_avg_temp": 12.5, "local_temp_range": 31.0},
-        {"name": "Boston_MA", "lat": 42.3601, "lon": -71.0589, "tz": "America/New_York", "local_avg_temp": 11.0, "local_temp_range": 33.0},
-        {"name": "San_Diego_CA", "lat": 32.7157, "lon": -117.1611, "tz": "America/Los_Angeles", "local_avg_temp": 18.5, "local_temp_range": 18.0},
-        {"name": "San_Francisco_CA", "lat": 37.7749, "lon": -122.4194, "tz": "America/Los_Angeles", "local_avg_temp": 15.0, "local_temp_range": 22.0},
-        {"name": "Manchester_UK", "lat": 53.4808, "lon": -2.2426, "tz": "Europe/London", "local_avg_temp": 10.5, "local_temp_range": 24.0},
-        {"name": "Birmingham_UK", "lat": 52.4862, "lon": -1.8904, "tz": "Europe/London", "local_avg_temp": 11.0, "local_temp_range": 25.0},
-        {"name": "Yokohama_JP", "lat": 35.4437, "lon": 139.6380, "tz": "Asia/Tokyo", "local_avg_temp": 16.0, "local_temp_range": 27.0},
-        {"name": "Osaka_JP", "lat": 34.6937, "lon": 135.5023, "tz": "Asia/Tokyo", "local_avg_temp": 16.5, "local_temp_range": 28.0},
-    ]
+    logger.error("❌ No cities configuration found. Place cities.json in the project root or set CITIES_JSON environment variable.")
+    raise FileNotFoundError("cities.json or CITIES_JSON env var is required")
 
 def build_neighbor_graph(cities: List[Dict], radius_km: float = 150.0) -> Dict[str, List[Dict]]:
     graph = {}
@@ -395,7 +377,7 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
     app.state.auto_update_task = asyncio.create_task(periodic_auto_update())
 
-    logger.info(f"🚀 ERM v{settings.VERSION} (SQLite + anomalies + Open-Meteo resilience + Plotly caching) started")
+    logger.info(f"🚀 ERM v{settings.VERSION} (full Phase 6 — back-testing + metrics + Plotly cache) started")
     yield
 
     for task_name in ('save_task', 'cleanup_task', 'auto_update_task'):
@@ -425,6 +407,8 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
         )
         if not df.empty:
             logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite (chronological order)")
+
+            # Populate raw history lists (fast load)
             for _, row in df.iterrows():
                 erm.history.append(row["temp"])
                 erm.humidity_history.append(row.get("humidity", 50.0))
@@ -435,11 +419,23 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
                 erm.performance_score = float(row.get("performance_score", 0.0))
                 erm.current_regime = row.get("current_regime", "stable")
                 erm.local_climatology = float(row.get("local_climatology", 15.0))
+
             if len(df) > 0:
                 erm.last_predicted = float(df.iloc[-1]["temp"])
+
+            # CRITICAL FIX: Replay full history so internal model state (regimes, smoothing, performance, etc.)
+            # is correctly restored after restart — prevents inconsistent state on first update
+            try:
+                replay_result = erm.replay_history(list(erm.history))
+                logger.info(f"🔄 Replayed {replay_result['steps']} historical steps for {name} (final regime: {replay_result['final_regime']})")
+            except Exception as e:
+                logger.warning(f"⚠️ History replay failed for {name} (non-fatal): {e}")
+
         else:
             logger.info(f"No records yet for {name} — starting fresh")
+
         erms[name] = erm
+
     conn.close()
     return erms
 
@@ -478,7 +474,7 @@ async def save_all_city_states(erms: Dict):
     logger.info(f"✅ Saved {saved_count} cities to SQLite")
     await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
-# ===================== GIT BACKUP =====================
+# ===================== GIT BACKUP (restored + optimized) =====================
 async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
     cmd = ["git"] + args
     try:
@@ -507,12 +503,15 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             remote_url = f"https://{token}@github.com/{repo}.git"
             await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
             await run_git_command(["pull", "origin", "main", "--rebase"], cwd, check=False)
+
+            # Only commit if there are actual changes (prevents noisy empty commits)
             await run_git_command(["add", "-A"], cwd)
             proc = await asyncio.create_subprocess_exec("git", "diff", "--cached", "--name-only", cwd=cwd, stdout=asyncio.subprocess.PIPE)
             stdout, _ = await proc.communicate()
             if not stdout.decode().strip():
                 logger.info("✅ No new changes to commit")
                 return
+
             await run_git_command(["commit", "-m", f"🚀 Auto-save {datetime.utcnow().isoformat()}"], cwd)
             await run_git_command(["push", "origin", "main"], cwd)
             logger.info("✅ Git backup completed")
@@ -586,7 +585,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ===================== ANOMALY ENDPOINT =====================
+# ===================== ANOMALY + BACKTEST + METRICS =====================
 @app.get("/anomalies")
 async def get_anomalies():
     return {
@@ -594,7 +593,42 @@ async def get_anomalies():
         for city in app.state.cities_config
     }
 
-# ===================== PLOTLY VISUALIZATION WITH CACHE (Phase 5) =====================
+@app.get("/backtest/{city}")
+async def backtest_city(city: str):
+    erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
+    if not erm:
+        raise HTTPException(status_code=404, detail="City not found")
+    if len(erm.history) < 10:
+        raise HTTPException(status_code=400, detail="Not enough historical data for back-testing")
+
+    result = erm.replay_history(list(erm.history))
+    return {
+        "city": city,
+        "mae": round(result["mae"], 3),
+        "steps": result["steps"],
+        "final_regime": result["final_regime"],
+        "performance_score": round(result["performance_score"], 3),
+        "message": "Back-test completed using historical temperature series"
+    }
+
+@app.get("/metrics")
+async def metrics():
+    if not hasattr(app.state, 'per_city_erms'):
+        return {"status": "not_ready"}
+    total_cities = len(app.state.per_city_erms)
+    total_records = sum(len(erm.history) for erm in app.state.per_city_erms.values())
+    avg_perf = round(np.mean([erm.performance_score for erm in app.state.per_city_erms.values()]), 3) if total_cities > 0 else 0.0
+
+    return {
+        "version": settings.VERSION,
+        "cities": total_cities,
+        "total_records": total_records,
+        "avg_performance": avg_perf,
+        "anomaly_count": sum(len(app.state.anomaly_tracker.anomalies[city]) for city in app.state.cities_config),
+        "uptime": "running"
+    }
+
+# ===================== PLOTLY VISUALIZATION WITH CACHE =====================
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
     erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
@@ -630,9 +664,7 @@ async def visualize_city(city: str):
         fig.add_annotation(text=f"Performance: {round(erm.performance_score*100, 1)}%", x=0.5, y=0.9, showarrow=False, font_size=24, font_color="#00ff88")
         html_str = pio.to_html(fig, full_html=True, include_plotlyjs="cdn")
 
-    # Save to cache
     cache_file.write_text(html_str, encoding="utf-8")
-
     return HTMLResponse(html_str)
 
 # ===================== DASHBOARD ENDPOINTS =====================
@@ -652,7 +684,7 @@ async def status():
         total_records=sum(counts.values()),
         per_city=counts,
         avg_performance=round(float(avg_perf), 3),
-        build_phase="active — SQLite + anomalies + Plotly caching"
+        build_phase="active — full Phase 6 (back-testing + metrics + Plotly)"
     )
 
 @app.get("/latest/{city}", response_model=CityData)
