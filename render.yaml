@@ -1,13 +1,29 @@
+# =============================================
+# ERM v10.1 — Render.com Blueprint
+# Two services: Backend (FastAPI) + Dashboard (Streamlit)
+# =============================================
+
 services:
+  # ── Backend Service (FastAPI + ERM model) ──
   - type: web
     name: erm-live
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
-    healthCheckPath: "/status"
+    healthCheckPath: "/health"          # ← improved from /status
     autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: GITHUB_TOKEN
+        sync: false                      # ← set this in Render Dashboard (Secrets)
+      - key: GITHUB_REPO
+        sync: false                      # ← set this in Render Dashboard (Secrets)
+      - key: CITIES_JSON               # optional: can override cities.json via env
+        sync: false
 
+  # ── Dashboard Service (Streamlit) ──
   - type: web
     name: erm-dashboard
     env: python
@@ -16,3 +32,8 @@ services:
     startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
     healthCheckPath: "/_stcore/health"
     autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # Streamlit secrets are automatically loaded from .streamlit/secrets.toml
+      # No extra env vars needed unless you add more later
