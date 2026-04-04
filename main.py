@@ -1,5 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import uvicorn
@@ -17,11 +17,13 @@ from typing import List, Dict, Optional, Any
 import math
 import base64
 from io import BytesIO
-import matplotlib.pyplot as plt
 import json
 import sqlite3
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+import plotly.graph_objects as go
+import plotly.io as pio
 
-# Phase 1: Modular ERM v3
+# Phase 1: Modular ERM v3 model
 from erm_model import ERM_Live_Adaptive
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -33,9 +35,10 @@ class Settings:
     STATE_DIR = Path(__file__).parent / "ERM_State"
     CITIES_CONFIG = Path(__file__).parent / "cities.json"
     DB_PATH = Path(__file__).parent / "ERM_Data" / "erm_data.db"
+    VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
     RATE_LIMIT_WINDOW = 45.0
-    VERSION = "9.7"
+    VERSION = "9.10"
     CSV_PREFIX = "erm_v9.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
@@ -47,7 +50,46 @@ class Settings:
     ANOMALY_PERF_DROP = 0.25
     ANOMALY_WINDOW = 12
 
+    MAX_RETRIES = 5
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 8
+    CIRCUIT_BREAKER_RESET_TIMEOUT_SEC = 180
+
+    VISUALIZATION_CACHE_TTL_MIN = 5
+
 settings = Settings()
+
+# Create cache directory
+settings.VISUALIZATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ===================== CIRCUIT BREAKER =====================
+class CircuitBreaker:
+    def __init__(self):
+        self.failures = 0
+        self.last_failure_time = 0
+        self.open = False
+
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure_time = datetime.now().timestamp()
+        if self.failures >= settings.CIRCUIT_BREAKER_FAILURE_THRESHOLD:
+            self.open = True
+            logger.warning("🚨 Circuit breaker OPEN — Open-Meteo calls paused for 3 minutes")
+
+    def record_success(self):
+        self.failures = 0
+        if self.open:
+            self.open = False
+            logger.info("✅ Circuit breaker CLOSED — Open-Meteo calls resumed")
+
+    def is_open(self):
+        if not self.open:
+            return False
+        if datetime.now().timestamp() - self.last_failure_time > settings.CIRCUIT_BREAKER_RESET_TIMEOUT_SEC:
+            self.open = False
+            logger.info("🔄 Circuit breaker auto-reset")
+        return self.open
+
+circuit_breaker = CircuitBreaker()
 
 # ===================== CITY CONFIG + NEIGHBOR GRAPH =====================
 def load_cities_config() -> List[Dict]:
@@ -222,8 +264,17 @@ async def migrate_from_csvs():
     if migrated:
         logger.info(f"✅ Migration complete — {migrated} cities moved to SQLite")
 
-# ===================== FETCH FUNCTIONS =====================
+# ===================== RESILIENT FETCH =====================
+@retry(
+    stop=stop_after_attempt(settings.MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(lambda e: isinstance(e, (httpx.RequestError, httpx.HTTPStatusError))),
+    reraise=True
+)
 async def fetch_city_data(city: Dict) -> Dict:
+    if circuit_breaker.is_open():
+        logger.warning(f"⛔ Circuit breaker open — skipping fetch for {city['name']}")
+        return {}
     name = city["name"]
     try:
         params = {
@@ -236,6 +287,7 @@ async def fetch_city_data(city: Dict) -> Dict:
         r.raise_for_status()
         current = r.json()["current"]
         logger.info(f"✅ Fetched live data for {name}")
+        circuit_breaker.record_success()
         return {
             "temp": float(current.get("temperature_2m", 15.0)),
             "humidity": float(current.get("relative_humidity_2m", 50.0)),
@@ -247,8 +299,9 @@ async def fetch_city_data(city: Dict) -> Dict:
             "wind_dir": float(current.get("wind_direction_10m", 180.0)),
         }
     except Exception as e:
-        logger.warning(f"Data fetch failed for {name}: {e}")
-        return {}
+        circuit_breaker.record_failure()
+        logger.warning(f"❌ Fetch failed for {name}: {e}")
+        raise
 
 async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
     tasks = [fetch_city_data(city) for city in cities]
@@ -258,6 +311,66 @@ async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
         name = city["name"]
         data[name] = result if isinstance(result, dict) else {"temp": 15.0, "humidity": 50.0, "wind": 5.0, "pressure": 1013.0, "rain_prob": 0.0, "cloud_cover": 30.0, "solar": 400.0, "wind_dir": 180.0}
     return data
+
+# ===================== CORE UPDATE LOGIC =====================
+async def _perform_city_updates():
+    logger.info("🚀 Starting optimized simultaneous update cycle")
+    cities = app.state.cities_config
+    live_data = await fetch_multi_variable_data(cities)
+
+    neighbor_influences = {}
+    for city in cities:
+        name = city["name"]
+        ground = live_data.get(name, {})
+        wind_dir = ground.get("wind_dir", 180.0)
+        neighbors = app.state.neighbor_graph.get(name, [])
+        neighbor_influences[name] = sum(neighbor_weight_enhanced(name, n, cities, wind_dir) for n in neighbors)
+
+    for city in cities:
+        name = city["name"]
+        ground = live_data.get(name, {})
+
+        now = datetime.now().timestamp()
+        async with rate_limiter_lock:
+            if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
+                continue
+            city_last_request[name] = now
+
+        erm = app.state.per_city_erms.get(name)
+        if not erm:
+            continue
+
+        prev_temp = erm.history[-1] if erm.history else ground.get("temp", 15.0)
+
+        erm.step(
+            current_temp=ground.get("temp", 15.0),
+            current_humidity=ground.get("humidity", 50.0),
+            current_wind=ground.get("wind", 5.0),
+            current_pressure=ground.get("pressure", 1013.0),
+            current_rain_prob=ground.get("rain_prob", 0.0),
+            current_cloud_cover=ground.get("cloud_cover", 30.0),
+            current_solar=ground.get("solar", 400.0),
+            current_wind_dir=ground.get("wind_dir", 180.0),
+            satellite_cloud_cover=ground.get("cloud_cover", 30.0),
+            satellite_radiation=ground.get("solar", 400.0),
+            hour_of_day=datetime.now().hour,
+            local_avg_temp=city.get("local_avg_temp", 15.0),
+            neighbor_influence=neighbor_influences[name],
+            dry_run=False
+        )
+
+        temp_jump = abs(erm.history[-1] - prev_temp) if erm.history else 0.0
+        app.state.anomaly_tracker.record(
+            name,
+            erm.Er_history[-1] if erm.Er_history else 0.0,
+            erm.performance_score,
+            erm.current_regime,
+            temp_jump
+        )
+
+    await save_all_city_states(app.state.per_city_erms)
+    logger.info("✅ Update + anomaly tracking completed")
+    return {"status": "updated", "timestamp": datetime.utcnow().isoformat(), "model": "ERM_v3", "cities": len(cities)}
 
 # ===================== LIFESPAN =====================
 @asynccontextmanager
@@ -282,7 +395,7 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
     app.state.auto_update_task = asyncio.create_task(periodic_auto_update())
 
-    logger.info(f"🚀 ERM v{settings.VERSION} (SQLite + anomalies + precomputed neighbors) started")
+    logger.info(f"🚀 ERM v{settings.VERSION} (SQLite + anomalies + Open-Meteo resilience + Plotly caching) started")
     yield
 
     for task_name in ('save_task', 'cleanup_task', 'auto_update_task'):
@@ -299,7 +412,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=f"ERM Live Update Service — v{settings.VERSION}", lifespan=lifespan)
 
-# ===================== LOAD CITY STATES (SQLite) =====================
+# ===================== LOAD CITY STATES =====================
 async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
     erms = {}
     conn = sqlite3.connect(settings.DB_PATH)
@@ -307,11 +420,11 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
         name = city["name"]
         erm = ERM_Live_Adaptive(city_name=name)
         df = pd.read_sql_query(
-            "SELECT * FROM records WHERE city = ? ORDER BY timestamp DESC LIMIT ?",
+            "SELECT * FROM records WHERE city = ? ORDER BY timestamp ASC LIMIT ?",
             conn, params=(name, settings.MAX_CSV_LOAD_RECORDS)
         )
         if not df.empty:
-            logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite")
+            logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite (chronological order)")
             for _, row in df.iterrows():
                 erm.history.append(row["temp"])
                 erm.humidity_history.append(row.get("humidity", 50.0))
@@ -323,14 +436,14 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
                 erm.current_regime = row.get("current_regime", "stable")
                 erm.local_climatology = float(row.get("local_climatology", 15.0))
             if len(df) > 0:
-                erm.last_predicted = float(df.iloc[0]["temp"])
+                erm.last_predicted = float(df.iloc[-1]["temp"])
         else:
             logger.info(f"No records yet for {name} — starting fresh")
         erms[name] = erm
     conn.close()
     return erms
 
-# ===================== SAVE ALL CITY STATES (SQLite) =====================
+# ===================== SAVE ALL CITY STATES =====================
 async def save_all_city_states(erms: Dict):
     logger.info("💾 Saving to SQLite...")
     conn = sqlite3.connect(settings.DB_PATH)
@@ -432,7 +545,7 @@ async def periodic_auto_update():
         await asyncio.sleep(settings.AUTO_UPDATE_INTERVAL_MIN * 60)
         try:
             logger.info("🔄 Auto-update cycle started")
-            await update_all_cities(None)
+            await _perform_city_updates()
         except Exception as e:
             logger.error(f"Auto-update failed: {e}")
 
@@ -468,62 +581,7 @@ class HealthResponse(BaseModel):
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
-        logger.info("🚀 Starting optimized update cycle")
-        cities = app.state.cities_config
-        live_data = await fetch_multi_variable_data(cities)
-
-        neighbor_influences = {}
-        for city in cities:
-            name = city["name"]
-            ground = live_data.get(name, {})
-            wind_dir = ground.get("wind_dir", 180.0)
-            neighbors = app.state.neighbor_graph.get(name, [])
-            neighbor_influences[name] = sum(neighbor_weight_enhanced(name, n, cities, wind_dir) for n in neighbors)
-
-        for city in cities:
-            name = city["name"]
-            ground = live_data.get(name, {})
-            now = datetime.now().timestamp()
-            async with rate_limiter_lock:
-                if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
-                    continue
-                city_last_request[name] = now
-
-            erm = app.state.per_city_erms.get(name)
-            if not erm:
-                continue
-
-            prev_temp = erm.history[-1] if erm.history else ground.get("temp", 15.0)
-
-            erm.step(
-                current_temp=ground.get("temp", 15.0),
-                current_humidity=ground.get("humidity", 50.0),
-                current_wind=ground.get("wind", 5.0),
-                current_pressure=ground.get("pressure", 1013.0),
-                current_rain_prob=ground.get("rain_prob", 0.0),
-                current_cloud_cover=ground.get("cloud_cover", 30.0),
-                current_solar=ground.get("solar", 400.0),
-                current_wind_dir=ground.get("wind_dir", 180.0),
-                satellite_cloud_cover=ground.get("cloud_cover", 30.0),
-                satellite_radiation=ground.get("solar", 400.0),
-                hour_of_day=datetime.now().hour,
-                local_avg_temp=city.get("local_avg_temp", 15.0),
-                neighbor_influence=neighbor_influences[name],
-                dry_run=False
-            )
-
-            temp_jump = abs(erm.history[-1] - prev_temp) if erm.history else 0.0
-            app.state.anomaly_tracker.record(
-                name,
-                erm.Er_history[-1] if erm.Er_history else 0.0,
-                erm.performance_score,
-                erm.current_regime,
-                temp_jump
-            )
-
-        await save_all_city_states(app.state.per_city_erms)
-        logger.info("✅ Update + anomaly tracking completed")
-        return {"status": "updated", "timestamp": datetime.utcnow().isoformat(), "model": "ERM_v3", "cities": len(cities)}
+        return await _perform_city_updates()
     except Exception as e:
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -535,6 +593,47 @@ async def get_anomalies():
         city["name"]: app.state.anomaly_tracker.get_city_status(city["name"])
         for city in app.state.cities_config
     }
+
+# ===================== PLOTLY VISUALIZATION WITH CACHE (Phase 5) =====================
+@app.get("/visualize/{city}")
+async def visualize_city(city: str):
+    erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
+    if not erm:
+        raise HTTPException(status_code=404, detail="City not found")
+
+    cache_file = settings.VISUALIZATION_CACHE_DIR / f"{city}.html"
+    if cache_file.exists():
+        cache_age = (datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)).total_seconds() / 60
+        if cache_age < settings.VISUALIZATION_CACHE_TTL_MIN:
+            logger.info(f"✅ Serving cached visualization for {city}")
+            return HTMLResponse(cache_file.read_text(encoding="utf-8"))
+
+    logger.info(f"📊 Generating fresh Plotly visualization for {city}")
+
+    if len(erm.history) < 5:
+        fig = go.Figure()
+        fig.add_annotation(text="Not enough data yet.<br>Run a few /update calls first.", showarrow=False, font_size=18)
+        fig.update_layout(height=400, title=f"ERM v{settings.VERSION} — {city}")
+        html_str = pio.to_html(fig, full_html=True)
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=list(erm.history), mode='lines', name='Live Temp', line=dict(color='#00ff88', width=3)))
+        if getattr(erm, 'last_predicted', None) is not None:
+            fig.add_hline(y=erm.last_predicted, line_dash="dash", line_color="#ffaa00", annotation_text="Last Prediction")
+        fig.update_layout(
+            title=f"ERM v{settings.VERSION} — {city} Live Dashboard",
+            xaxis_title="Time Steps",
+            yaxis_title="Temperature (°C)",
+            template="plotly_dark",
+            height=600
+        )
+        fig.add_annotation(text=f"Performance: {round(erm.performance_score*100, 1)}%", x=0.5, y=0.9, showarrow=False, font_size=24, font_color="#00ff88")
+        html_str = pio.to_html(fig, full_html=True, include_plotlyjs="cdn")
+
+    # Save to cache
+    cache_file.write_text(html_str, encoding="utf-8")
+
+    return HTMLResponse(html_str)
 
 # ===================== DASHBOARD ENDPOINTS =====================
 @app.get("/health", response_model=HealthResponse)
@@ -553,7 +652,7 @@ async def status():
         total_records=sum(counts.values()),
         per_city=counts,
         avg_performance=round(float(avg_perf), 3),
-        build_phase="active — SQLite + anomalies enabled"
+        build_phase="active — SQLite + anomalies + Plotly caching"
     )
 
 @app.get("/latest/{city}", response_model=CityData)
@@ -581,62 +680,6 @@ async def get_predict(city: str):
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return PredictionResponse(**result)
-
-@app.get("/visualize/{city}")
-async def visualize_city(city: str):
-    erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
-    if not erm:
-        raise HTTPException(status_code=404, detail="City not found")
-    try:
-        logger.info(f"📊 Generating visualization for {city}")
-        if len(erm.history) < 5:
-            fig, ax = plt.subplots(figsize=(8, 6))
-            ax.text(0.5, 0.5, "Not enough data yet.\nRun a few /update calls first.", ha="center", va="center", fontsize=14, color="#ffaa00")
-            ax.axis("off")
-            buf = BytesIO()
-            plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            buf.seek(0)
-            return {"visualization": {"dashboard_png_base64": base64.b64encode(buf.read()).decode("utf-8")}}
-
-        fig, axs = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle(f"ERM v{settings.VERSION} — {city} Live Dashboard", fontsize=16, color="#00ff88")
-        axs[0, 0].plot(list(erm.history), color="#00ff88", linewidth=2, label="Live Temp")
-        if getattr(erm, 'last_predicted', None) is not None:
-            axs[0, 0].axhline(erm.last_predicted, color="#ffaa00", linestyle="--", label="Last Prediction")
-        axs[0, 0].set_title("Temperature History")
-        axs[0, 0].legend()
-        axs[0, 0].grid(True, alpha=0.3)
-
-        regimes = list(erm.regime_tracker.keys()) or ["stable"]
-        success = [erm.regime_tracker.get(r, {"success": 0})["success"] for r in regimes]
-        axs[0, 1].bar(regimes, success, color="#00ff88")
-        axs[0, 1].set_title("Regime Success Rate")
-
-        axs[1, 0].bar(["Persistence", "Linear", "ERM"], [2.1, 1.8, erm.performance_score * 2], color=["#666", "#666", "#00ff88"])
-        axs[1, 0].set_title("Benchmark MAE (lower = better)")
-
-        axs[1, 1].text(0.5, 0.5, f"Confidence\n{round(erm.performance_score*100, 1)}%", ha="center", va="center", fontsize=24, color="#00ff88")
-        axs[1, 1].axis("off")
-        axs[1, 1].set_title("Overall Confidence")
-
-        plt.tight_layout()
-        buf = BytesIO()
-        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode("utf-8")
-
-        return {
-            "visualization": {
-                "dashboard_png_base64": img_base64,
-                "records": len(erm.history),
-                "current_regime": erm.current_regime
-            }
-        }
-    except Exception as e:
-        logger.error(f"Visualize failed for {city}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
