@@ -50,7 +50,7 @@ class Settings:
 
     MAX_RETRIES = 5
     CIRCUIT_BREAKER_FAILURE_THRESHOLD = 8
-    CIRCUIT_BREAKER_RESET_TIMEOUT_SEC = 30   # ← changed to 30 seconds for faster recovery
+    CIRCUIT_BREAKER_RESET_TIMEOUT_SEC = 30
 
     VISUALIZATION_CACHE_TTL_MIN = 5
 
@@ -243,7 +243,7 @@ async def migrate_from_csvs():
     if migrated:
         logger.info(f"✅ Migration complete — {migrated} cities moved to SQLite")
 
-# ===================== RESILIENT FETCH =====================
+# ===================== RESILIENT FETCH (with delay to prevent 429) =====================
 @retry(
     stop=stop_after_attempt(settings.MAX_RETRIES),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -283,12 +283,12 @@ async def fetch_city_data(city: Dict) -> Dict:
         raise
 
 async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
-    tasks = [fetch_city_data(city) for city in cities]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
     data = {}
-    for city, result in zip(cities, results):
+    for city in cities:  # Sequential with small delay to avoid 429
+        result = await fetch_city_data(city)
         name = city["name"]
         data[name] = result if isinstance(result, dict) else {"temp": 15.0, "humidity": 50.0, "wind": 5.0, "pressure": 1013.0, "rain_prob": 0.0, "cloud_cover": 30.0, "solar": 400.0, "wind_dir": 180.0}
+        await asyncio.sleep(0.6)  # ← prevents rate limit
     return data
 
 # ===================== CORE UPDATE LOGIC =====================
@@ -498,7 +498,7 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             await run_git_command(["config", "--global", "user.email", "erm-bot@render.com"], cwd)
             await run_git_command(["config", "--global", "user.name", "ERM Render Bot"], cwd)
             remote_url = f"https://{token}@github.com/{repo}.git"
-            await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
+            await run_git_command(["remote", "set-url", "origin", remote_url"], cwd, check=False)
             await run_git_command(["pull", "origin", "main", "--rebase"], cwd, check=False)
 
             await run_git_command(["add", "-A"], cwd)
@@ -700,7 +700,6 @@ async def get_predict(city: str):
     if not erm:
         raise HTTPException(status_code=404, detail="City not found")
     
-    # Fixed: graceful handling when model has no data yet
     if erm.last_predicted is None or len(erm.history) < 4:
         return PredictionResponse(
             predictions={"1h": None, "3h": None, "6h": None, "12h": None, "24h": None},
@@ -711,7 +710,6 @@ async def get_predict(city: str):
     result = erm.predict_future()
     return PredictionResponse(**result)
 
-# New helper endpoint to manually reset circuit breaker if it gets stuck
 @app.get("/reset-circuit")
 async def reset_circuit_breaker():
     circuit_breaker.failures = 0
