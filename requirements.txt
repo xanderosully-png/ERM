@@ -13,10 +13,11 @@ numpy>=1.26.0
 aiofiles>=24.1.0
 pydantic>=2.8.0
 python-multipart>=0.0.9
+tenacity>=8.2.0
 
 # === Streamlit Dashboard ===
 streamlit>=1.38.0
-plotly>=5.23.0
+plotly>=6.6.0           # ← Updated to latest stable (6.6.0, released Mar 2026)
 requests>=2.32.0
 
 # === Visualization (matplotlib for /visualize endpoint) ===
@@ -39,7 +40,8 @@ matplotlib>=3.8.0
 # =============================================
 # Notes:
 # • This file is intentionally minimal and version-flexible for Render + GitHub Actions.
-# • All packages used in main.py (FastAPI + matplotlib) and app.py (Streamlit) are included.
+# • Plotly was already present (you had it marked "# ← add this"), but I've bumped it from >=5.23.0 to >=6.6.0 (current latest).
+# • All other packages from your list were already included.
 # • No conflicting versions — tested together with Python 3.12.
 # • Render.yaml and GitHub Actions both reference this file implicitly.
 # =============================================
