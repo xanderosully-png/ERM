@@ -1,38 +1,18 @@
-# render.yaml
-# ERM v10.0 — Full deployment: FastAPI backend + Streamlit Dashboard
-# One file → deploys both services from GitHub
-
 services:
-  # ==================== FASTAPI BACKEND (main.py) ====================
   - type: web
     name: erm-live
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
-    
-    envVars:
-      - key: GITHUB_TOKEN
-        sync: false
-      - key: GITHUB_REPO
-        sync: false
-      - key: PYTHON_VERSION
-        value: "3.12"
-    
     healthCheckPath: "/status"
     autoDeploy: true
 
-  # ==================== STREAMLIT DASHBOARD (app.py) ====================
   - type: web
     name: erm-dashboard
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
-    
-    envVars:
-      - key: PYTHON_VERSION
-        value: "3.12"
-    
     healthCheckPath: "/_stcore/health"
     autoDeploy: true
