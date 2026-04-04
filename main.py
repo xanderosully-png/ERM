@@ -21,7 +21,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import plotly.graph_objects as go
 import plotly.io as pio
 
-# Phase 1: Modular ERM v3 model (unchanged)
+# Phase 1: Modular ERM v3 model
 from erm_model import ERM_Live_Adaptive
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -36,8 +36,8 @@ class Settings:
     VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
     RATE_LIMIT_WINDOW = 45.0
-    VERSION = "10.1"                    # ← updated
-    CSV_PREFIX = "erm_v10.0"            # ← updated for v10.1
+    VERSION = "10.1"
+    CSV_PREFIX = "erm_v10.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
     AUTO_UPDATE_INTERVAL_MIN = 10
@@ -50,7 +50,7 @@ class Settings:
 
     MAX_RETRIES = 5
     CIRCUIT_BREAKER_FAILURE_THRESHOLD = 8
-    CIRCUIT_BREAKER_RESET_TIMEOUT_SEC = 180
+    CIRCUIT_BREAKER_RESET_TIMEOUT_SEC = 30   # ← changed to 30 seconds for faster recovery
 
     VISUALIZATION_CACHE_TTL_MIN = 5
 
@@ -71,7 +71,7 @@ class CircuitBreaker:
         self.last_failure_time = datetime.now().timestamp()
         if self.failures >= settings.CIRCUIT_BREAKER_FAILURE_THRESHOLD:
             self.open = True
-            logger.warning("🚨 Circuit breaker OPEN — Open-Meteo calls paused for 3 minutes")
+            logger.warning("🚨 Circuit breaker OPEN — Open-Meteo calls paused")
 
     def record_success(self):
         self.failures = 0
@@ -180,7 +180,6 @@ class AnomalyTracker:
 city_last_request: Dict[str, float] = {}
 rate_limiter_lock = asyncio.Lock()
 git_backup_lock = asyncio.Lock()
-csv_write_lock = asyncio.Lock()
 http_client: Optional[httpx.AsyncClient] = None
 anomaly_tracker = AnomalyTracker()
 
@@ -472,7 +471,7 @@ async def save_all_city_states(erms: Dict):
     logger.info(f"✅ Saved {saved_count} cities to SQLite")
     await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
-# ===================== GIT BACKUP (unchanged) =====================
+# ===================== GIT BACKUP =====================
 async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
     cmd = ["git"] + args
     try:
@@ -556,7 +555,7 @@ class CityData(BaseModel):
     anomaly_status: str = "normal"
 
 class PredictionResponse(BaseModel):
-    predictions: Dict[str, float]
+    predictions: Dict[str, Optional[float]]
     current_regime: str
     confidence: float
 
@@ -700,10 +699,25 @@ async def get_predict(city: str):
     erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
     if not erm:
         raise HTTPException(status_code=404, detail="City not found")
+    
+    # Fixed: graceful handling when model has no data yet
+    if erm.last_predicted is None or len(erm.history) < 4:
+        return PredictionResponse(
+            predictions={"1h": None, "3h": None, "6h": None, "12h": None, "24h": None},
+            current_regime=erm.current_regime,
+            confidence=0.0
+        )
+    
     result = erm.predict_future()
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
     return PredictionResponse(**result)
+
+# New helper endpoint to manually reset circuit breaker if it gets stuck
+@app.get("/reset-circuit")
+async def reset_circuit_breaker():
+    circuit_breaker.failures = 0
+    circuit_breaker.open = False
+    logger.info("🔄 Circuit breaker manually reset")
+    return {"status": "circuit breaker reset", "open": False}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
