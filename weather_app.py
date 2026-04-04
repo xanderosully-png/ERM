@@ -9,7 +9,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Paste your EXACT custom CSS from the visualizer here (I copied it directly from the code you shared)
+# Paste your EXACT custom CSS from the visualizer here
 st.markdown("""
 <style>
     .header-container {
@@ -79,7 +79,7 @@ st.markdown("""
 
 st.divider()
 
-# ====================== CITY INPUT (default to your location) ======================
+# ====================== CITY INPUT ======================
 col1, col2 = st.columns([3, 1])
 with col1:
     city = st.text_input(
@@ -88,35 +88,39 @@ with col1:
         value="Pataskala",
         label_visibility="collapsed"
     )
-with col2:
-    if st.button("🔎 Get Weather", type="primary", use_container_width=True):
-        pass  # trigger below
 
+# Single button (no more duplicate!)
 if st.button("🔎 Get Weather", type="primary", use_container_width=True):
     with st.spinner("🌎 Fetching live weather..."):
-        # 1. Geocode (free, no key)
-        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json"
-        geo_resp = requests.get(geo_url)
-        
-        if geo_resp.status_code != 200 or not geo_resp.json().get("results"):
-            st.error("😕 City not found. Try 'Pataskala', 'Columbus', or any city name.")
-            st.stop()
-        
-        loc = geo_resp.json()["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        city_name = loc["name"]
-        region = loc.get("admin1", "")
-        country = loc.get("country", "")
+        @st.cache_data(ttl=300)  # 5-minute cache
+        def get_weather(city_name: str):
+            # 1. Geocode
+            geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_name}&count=1&language=en&format=json"
+            geo_resp = requests.get(geo_url)
+            
+            if geo_resp.status_code != 200 or not geo_resp.json().get("results"):
+                st.error("😕 City not found. Try 'Pataskala', 'Columbus', or any city name.")
+                st.stop()
+            
+            loc = geo_resp.json()["results"][0]
+            lat, lon = loc["latitude"], loc["longitude"]
+            city_name_clean = loc["name"]
+            region = loc.get("admin1", "")
+            country = loc.get("country", "")
 
-        # 2. Weather API (free Open-Meteo)
-        weather_url = (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,"
-            f"apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m&"
-            f"daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto"
-        )
-        w_resp = requests.get(weather_url)
-        data = w_resp.json()
+            # 2. Weather API
+            weather_url = (
+                f"https://api.open-meteo.com/v1/forecast?"
+                f"latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,"
+                f"apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m&"
+                f"daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto"
+            )
+            w_resp = requests.get(weather_url)
+            data = w_resp.json()
+            return data, loc, city_name_clean, region, country
+
+        data, loc, city_name, region, country = get_weather(city)
+
         current = data["current"]
         daily = data["daily"]
 
