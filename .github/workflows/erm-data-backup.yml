@@ -1,36 +1,37 @@
-name: ERM Data Backup & Persist (Safety Net)
+name: ERM Data Cleanup
 
 on:
   schedule:
-    - cron: '*/30 * * * *'     # Every 30 minutes (safety net — in-app backup is primary)
+    - cron: '0 3 * * *'     # Every day at 3 AM UTC
   workflow_dispatch:
 
 jobs:
-  backup:
+  cleanup:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Commit and push any new ERM_Data CSVs
+      - name: Delete old CSVs (> 7 days) — v10.1
         run: |
-          echo "🔍 Checking for new ERM_Data changes..."
-          
-          git config --global user.name "ERM Data Bot"
+          echo "🧹 Searching for erm_v10.0_*.csv files older than 7 days..."
+          find ERM_Data -name "erm_v10.0_*.csv" -type f -mtime +7 -delete || true
+          echo "✅ Cleanup completed"
+
+      - name: Commit and push cleanup (if changes exist)
+        run: |
+          git config --global user.name "ERM Cleanup Bot"
           git config --global user.email "erm-bot@github.com"
           
           git add ERM_Data/
           
           if git diff --cached --quiet; then
-            echo "✅ No new data to commit"
+            echo "No changes to commit - cleanup found nothing to delete."
           else
-            git commit -m "📊 Safety backup: ERM_Data CSVs $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git commit -m "🧹 Auto-cleanup: removed v10.0 CSVs older than 7 days"
             git push origin main
-            echo "✅ Successfully pushed new ERM_Data CSVs to GitHub"
+            echo "✅ Changes committed and pushed"
           fi
