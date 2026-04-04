@@ -1,7 +1,9 @@
 # render.yaml
-# ERM v9.1 — GitHub-only persistence (in-app git backup + safety Action)
+# ERM v10.0 — Full deployment: FastAPI backend + Streamlit Dashboard
+# One file → deploys both services from GitHub
 
 services:
+  # ==================== FASTAPI BACKEND (main.py) ====================
   - type: web
     name: erm-live
     env: python
@@ -13,10 +15,24 @@ services:
       - key: GITHUB_TOKEN
         sync: false
       - key: GITHUB_REPO
-        sync: false               # e.g. "yourusername/erm-forecast"
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12"
     
-    healthCheckPath: "/status"    # better than /health
+    healthCheckPath: "/status"
     autoDeploy: true
-    # NO disk section — we use git push
+
+  # ==================== STREAMLIT DASHBOARD (app.py) ====================
+  - type: web
+    name: erm-dashboard
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0"
+    
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+    
+    healthCheckPath: "/_stcore/health"
+    autoDeploy: true
