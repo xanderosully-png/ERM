@@ -19,8 +19,9 @@ import base64
 from io import BytesIO
 import matplotlib.pyplot as plt
 import json
+import sqlite3
 
-# Phase 1: Modular ERM v3 model
+# Phase 1: Modular ERM v3
 from erm_model import ERM_Live_Adaptive
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -31,16 +32,16 @@ class Settings:
     DATA_DIR = Path(__file__).parent / "ERM_Data"
     STATE_DIR = Path(__file__).parent / "ERM_State"
     CITIES_CONFIG = Path(__file__).parent / "cities.json"
+    DB_PATH = Path(__file__).parent / "ERM_Data" / "erm_data.db"
 
     RATE_LIMIT_WINDOW = 45.0
-    VERSION = "9.6"
+    VERSION = "9.7"
     CSV_PREFIX = "erm_v9.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
     AUTO_UPDATE_INTERVAL_MIN = 10
     MAX_CSV_LOAD_RECORDS = 100
 
-    # Anomaly thresholds
     ANOMALY_ER_THRESHOLD = 0.80
     ANOMALY_TEMP_JUMP = 5.0
     ANOMALY_PERF_DROP = 0.25
@@ -69,7 +70,7 @@ def load_cities_config() -> List[Dict]:
             logger.error(f"Failed to load cities.json: {e}")
 
     logger.warning("⚠️ Using built-in fallback (18 cities)")
-    return [  # original 18 cities
+    return [
         {"name": "Columbus_OH", "lat": 39.9612, "lon": -82.9988, "tz": "America/New_York", "local_avg_temp": 11.5, "local_temp_range": 35.0},
         {"name": "Miami_FL", "lat": 25.7617, "lon": -80.1918, "tz": "America/New_York", "local_avg_temp": 25.0, "local_temp_range": 15.0},
         {"name": "New_York_NY", "lat": 40.7128, "lon": -74.0060, "tz": "America/New_York", "local_avg_temp": 12.0, "local_temp_range": 32.0},
@@ -161,7 +162,67 @@ csv_write_lock = asyncio.Lock()
 http_client: Optional[httpx.AsyncClient] = None
 anomaly_tracker = AnomalyTracker()
 
-# ===================== MERGED FETCH =====================
+# ===================== SQLITE HELPERS =====================
+def init_database():
+    settings.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(settings.DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            city TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            temp REAL,
+            humidity REAL,
+            wind REAL,
+            pressure REAL,
+            Er REAL,
+            smoothed_er REAL,
+            performance_score REAL,
+            current_regime TEXT,
+            local_climatology REAL,
+            UNIQUE(city, timestamp)
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ SQLite database initialized at {settings.DB_PATH}")
+
+async def migrate_from_csvs():
+    logger.info("🔄 Checking for CSV → SQLite migration...")
+    migrated = 0
+    for csv_file in settings.DATA_DIR.glob(f"{settings.CSV_PREFIX}_*.csv"):
+        city = csv_file.stem.replace(f"{settings.CSV_PREFIX}_", "")
+        try:
+            df = pd.read_csv(csv_file)
+            conn = sqlite3.connect(settings.DB_PATH)
+            for _, row in df.iterrows():
+                conn.execute("""
+                    INSERT OR IGNORE INTO records 
+                    (city, timestamp, temp, humidity, wind, pressure, Er, smoothed_er, 
+                     performance_score, current_regime, local_climatology)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    city,
+                    row.get("timestamp", datetime.utcnow().isoformat()),
+                    row.get("temp"),
+                    row.get("humidity", 50.0),
+                    row.get("wind", 5.0),
+                    row.get("pressure", 1013.0),
+                    row.get("Er", 0.0),
+                    row.get("smoothed_er", 0.0),
+                    row.get("performance_score", 0.0),
+                    row.get("current_regime", "stable"),
+                    row.get("local_climatology", 15.0)
+                ))
+            conn.commit()
+            conn.close()
+            migrated += 1
+        except Exception as e:
+            logger.error(f"Migration failed for {city}: {e}")
+    if migrated:
+        logger.info(f"✅ Migration complete — {migrated} cities moved to SQLite")
+
+# ===================== FETCH FUNCTIONS =====================
 async def fetch_city_data(city: Dict) -> Dict:
     name = city["name"]
     try:
@@ -205,6 +266,9 @@ async def lifespan(app: FastAPI):
     for d in (settings.DATA_DIR, settings.STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
+    init_database()
+    await migrate_from_csvs()
+
     cities = load_cities_config()
     app.state.cities_config = cities
     app.state.neighbor_graph = build_neighbor_graph(cities)
@@ -218,7 +282,7 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
     app.state.auto_update_task = asyncio.create_task(periodic_auto_update())
 
-    logger.info(f"🚀 ERM v{settings.VERSION} (Phase 2 + anomalies + precomputed neighbors) started")
+    logger.info(f"🚀 ERM v{settings.VERSION} (SQLite + anomalies + precomputed neighbors) started")
     yield
 
     for task_name in ('save_task', 'cleanup_task', 'auto_update_task'):
@@ -235,83 +299,70 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=f"ERM Live Update Service — v{settings.VERSION}", lifespan=lifespan)
 
-# ===================== LOAD CITY STATES =====================
+# ===================== LOAD CITY STATES (SQLite) =====================
 async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
     erms = {}
+    conn = sqlite3.connect(settings.DB_PATH)
     for city in cities:
         name = city["name"]
         erm = ERM_Live_Adaptive(city_name=name)
-        csv_file = settings.DATA_DIR / f"{settings.CSV_PREFIX}_{name}.csv"
-        if csv_file.exists():
-            try:
-                df = pd.read_csv(csv_file).tail(settings.MAX_CSV_LOAD_RECORDS)
-                logger.info(f"✅ Loaded last {len(df)} records for {name}")
-                for _, row in df.iterrows():
-                    erm.history.append(row["temp"])
-                    erm.humidity_history.append(row.get("humidity", 50.0))
-                    erm.wind_history.append(row.get("wind", 5.0))
-                    erm.pressure_history.append(row.get("pressure", 1013.0))
-                    erm.Er_history.append(row.get("Er", 0.0))
-                    erm.smoothed_er = float(row.get("smoothed_er", 0.0))
-                    erm.performance_score = float(row.get("performance_score", 0.0))
-                    erm.current_regime = row.get("current_regime", "stable")
-                    erm.local_climatology = float(row.get("local_climatology", 15.0))
-                if len(df) > 0:
-                    erm.last_predicted = float(df.iloc[-1]["temp"])
-            except Exception as e:
-                logger.error(f"Failed to load {name}: {e}")
+        df = pd.read_sql_query(
+            "SELECT * FROM records WHERE city = ? ORDER BY timestamp DESC LIMIT ?",
+            conn, params=(name, settings.MAX_CSV_LOAD_RECORDS)
+        )
+        if not df.empty:
+            logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite")
+            for _, row in df.iterrows():
+                erm.history.append(row["temp"])
+                erm.humidity_history.append(row.get("humidity", 50.0))
+                erm.wind_history.append(row.get("wind", 5.0))
+                erm.pressure_history.append(row.get("pressure", 1013.0))
+                erm.Er_history.append(row.get("Er", 0.0))
+                erm.smoothed_er = float(row.get("smoothed_er", 0.0))
+                erm.performance_score = float(row.get("performance_score", 0.0))
+                erm.current_regime = row.get("current_regime", "stable")
+                erm.local_climatology = float(row.get("local_climatology", 15.0))
+            if len(df) > 0:
+                erm.last_predicted = float(df.iloc[0]["temp"])
         else:
-            logger.info(f"No CSV yet for {name} — starting fresh")
+            logger.info(f"No records yet for {name} — starting fresh")
         erms[name] = erm
-    logger.info(f"🚀 Initialized ERM v3 for {len(erms)} cities")
+    conn.close()
     return erms
 
-# ===================== SAVE ALL CITY STATES =====================
+# ===================== SAVE ALL CITY STATES (SQLite) =====================
 async def save_all_city_states(erms: Dict):
-    logger.info("💾 Starting incremental save...")
-    async with csv_write_lock:
-        saved_count = 0
-        for name, erm in erms.items():
-            csv_file = settings.DATA_DIR / f"{settings.CSV_PREFIX}_{name}.csv"
-            try:
-                if len(erm.history) == 0:
-                    continue
-
-                row = {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "temp": erm.history[-1],
-                    "humidity": erm.humidity_history[-1] if erm.humidity_history else 50.0,
-                    "wind": erm.wind_history[-1] if erm.wind_history else 5.0,
-                    "pressure": erm.pressure_history[-1] if erm.pressure_history else 1013.0,
-                    "Er": erm.Er_history[-1] if erm.Er_history else 0.0,
-                    "smoothed_er": erm.smoothed_er,
-                    "performance_score": erm.performance_score,
-                    "current_regime": erm.current_regime,
-                    "local_climatology": erm.local_climatology,
-                }
-
-                should_write = True
-                if csv_file.exists():
-                    try:
-                        last_df = pd.read_csv(csv_file).tail(1)
-                        if not last_df.empty:
-                            last_temp = float(last_df.iloc[0]["temp"])
-                            last_er = float(last_df.iloc[0]["Er"])
-                            if abs(last_temp - row["temp"]) < 0.1 and abs(last_er - row["Er"]) < 0.1:
-                                should_write = False
-                                logger.debug(f"⏭️ Skipped duplicate record for {name}")
-                    except Exception:
-                        pass
-
-                if should_write:
-                    df = pd.DataFrame([row])
-                    df.to_csv(csv_file, mode='a', header=not csv_file.exists(), index=False)
-                    logger.info(f"✅ Appended record for {name}")
-                    saved_count += 1
-            except Exception as e:
-                logger.error(f"❌ Failed to save {name}: {e}")
-        logger.info(f"💾 Incremental save finished — {saved_count} cities updated")
-
+    logger.info("💾 Saving to SQLite...")
+    conn = sqlite3.connect(settings.DB_PATH)
+    saved_count = 0
+    for name, erm in erms.items():
+        if len(erm.history) == 0:
+            continue
+        try:
+            conn.execute("""
+                INSERT OR IGNORE INTO records 
+                (city, timestamp, temp, humidity, wind, pressure, Er, smoothed_er, 
+                 performance_score, current_regime, local_climatology)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                name,
+                datetime.utcnow().isoformat(),
+                erm.history[-1],
+                erm.humidity_history[-1] if erm.humidity_history else 50.0,
+                erm.wind_history[-1] if erm.wind_history else 5.0,
+                erm.pressure_history[-1] if erm.pressure_history else 1013.0,
+                erm.Er_history[-1] if erm.Er_history else 0.0,
+                erm.smoothed_er,
+                erm.performance_score,
+                erm.current_regime,
+                erm.local_climatology
+            ))
+            saved_count += 1
+        except Exception as e:
+            logger.error(f"SQLite save failed for {name}: {e}")
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ Saved {saved_count} cities to SQLite")
     await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
 # ===================== GIT BACKUP =====================
@@ -320,11 +371,13 @@ async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await proc.communicate()
+        stdout_str = stdout.decode().strip()
+        stderr_str = stderr.decode().strip()
         if check and proc.returncode != 0:
-            raise RuntimeError(f"Git command failed: {stderr.decode()}")
+            raise RuntimeError(f"Git failed: {stderr_str or stdout_str}")
         return proc.returncode
     except Exception as e:
-        logger.error(f"Git error: {e}")
+        logger.error(f"Git subprocess error: {e}")
         raise
 
 async def async_git_backup(data_dir: Path, state_dir: Path):
@@ -391,7 +444,7 @@ class CityData(BaseModel):
     current_regime: str
     performance_score: float
     timestamp: str
-    anomaly_status: str = "normal"   # ← added for your enhancement
+    anomaly_status: str = "normal"
 
 class PredictionResponse(BaseModel):
     predictions: Dict[str, float]
@@ -411,15 +464,14 @@ class HealthResponse(BaseModel):
     version: str
     uptime: str = "running"
 
-# ===================== OPTIMIZED UPDATE ENDPOINT =====================
+# ===================== UPDATE ENDPOINT =====================
 @app.get("/update")
 async def update_all_cities(background_tasks: BackgroundTasks):
     try:
-        logger.info("🚀 Starting optimized simultaneous update cycle")
+        logger.info("🚀 Starting optimized update cycle")
         cities = app.state.cities_config
         live_data = await fetch_multi_variable_data(cities)
 
-        # Pre-compute neighbor influences
         neighbor_influences = {}
         for city in cities:
             name = city["name"]
@@ -431,7 +483,6 @@ async def update_all_cities(background_tasks: BackgroundTasks):
         for city in cities:
             name = city["name"]
             ground = live_data.get(name, {})
-
             now = datetime.now().timestamp()
             async with rate_limiter_lock:
                 if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
@@ -471,7 +522,7 @@ async def update_all_cities(background_tasks: BackgroundTasks):
             )
 
         await save_all_city_states(app.state.per_city_erms)
-        logger.info("✅ Optimized update + anomaly tracking completed")
+        logger.info("✅ Update + anomaly tracking completed")
         return {"status": "updated", "timestamp": datetime.utcnow().isoformat(), "model": "ERM_v3", "cities": len(cities)}
     except Exception as e:
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
@@ -502,7 +553,7 @@ async def status():
         total_records=sum(counts.values()),
         per_city=counts,
         avg_performance=round(float(avg_perf), 3),
-        build_phase="active — anomalies enabled"
+        build_phase="active — SQLite + anomalies enabled"
     )
 
 @app.get("/latest/{city}", response_model=CityData)
@@ -533,13 +584,11 @@ async def get_predict(city: str):
 
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
-    # (your original visualization code — unchanged)
     erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
     if not erm:
         raise HTTPException(status_code=404, detail="City not found")
     try:
-        logger.info(f"📊 Generating visualization for {city} (records: {len(erm.history)})")
-
+        logger.info(f"📊 Generating visualization for {city}")
         if len(erm.history) < 5:
             fig, ax = plt.subplots(figsize=(8, 6))
             ax.text(0.5, 0.5, "Not enough data yet.\nRun a few /update calls first.", ha="center", va="center", fontsize=14, color="#ffaa00")
@@ -552,7 +601,6 @@ async def visualize_city(city: str):
 
         fig, axs = plt.subplots(2, 2, figsize=(12, 8))
         fig.suptitle(f"ERM v{settings.VERSION} — {city} Live Dashboard", fontsize=16, color="#00ff88")
-
         axs[0, 0].plot(list(erm.history), color="#00ff88", linewidth=2, label="Live Temp")
         if getattr(erm, 'last_predicted', None) is not None:
             axs[0, 0].axhline(erm.last_predicted, color="#ffaa00", linestyle="--", label="Last Prediction")
