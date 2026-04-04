@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 from datetime import datetime
 from typing import Optional
@@ -182,8 +181,7 @@ with tab4:
     st.subheader("4. Live Visualizations (Plotly)")
     if selected_city:
         viz_html = fetch_visualization(backend_url, selected_city)
-        # Fixed: use st.iframe instead of deprecated st.components.v1.html
-        st.iframe(viz_html, height=700, scrolling=True)
+        st.components.v1.html(viz_html, height=700, scrolling=True)
     else:
         st.info("Select a city above")
 
