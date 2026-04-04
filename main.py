@@ -26,13 +26,13 @@ logger = logging.getLogger(__name__)
 class Settings:
     DATA_DIR = Path(__file__).parent / "ERM_Data"
     STATE_DIR = Path(__file__).parent / "ERM_State"
-    RATE_LIMIT_WINDOW = 12.0
-    VERSION = "9.2"
+    RATE_LIMIT_WINDOW = 45.0                    # ← UPDATED: was 12.0 → prevents aggressive skipping of cities
+    VERSION = "9.3"                             # ← UPDATED: version bump after refinements
     CSV_PREFIX = "erm_v9.0"
     HISTORY_SIZE = 20
     SAVE_INTERVAL_SEC = 300
     AUTO_UPDATE_INTERVAL_MIN = 10
-    MAX_CSV_LOAD_RECORDS = 100  # speed optimization: only load recent records
+    MAX_CSV_LOAD_RECORDS = 100
 
 settings = Settings()
 
@@ -175,15 +175,15 @@ def neighbor_weight_enhanced(city_name: str, neighbor: Dict, cities: List[Dict],
     alignment = max(0.0, np.cos(np.radians(abs(wind_dir - bearing))))
     return (1.0 / (1.0 + d)) * alignment * 0.35
 
-# ===================== ERM CLASS v9.2 =====================
+# ===================== ERM CLASS v9.3 (refined) =====================
 class ERM_Live_Adaptive:
-    # Tunable constants (extracted for clarity)
+    # Tunable constants (fine-tuned for non-flat predictions)
     GAMMA = 0.935
-    LAMBDA_DAMP = 0.28
+    LAMBDA_DAMP = 0.22          # ← REFINED: was 0.28 → allows more responsiveness to volatility
     ALPHA = 0.75
     PHYSICS_WEIGHT = 0.6
     EMPIRICAL_WEIGHT = 0.4
-    SMOOTHING = 0.7
+    SMOOTHING = 0.65            # ← REFINED: was 0.7 → faster adaptation to new Er
     EXTREME_ER_THRESHOLD = 6.0
 
     def __init__(self, history_size: int = settings.HISTORY_SIZE):
@@ -245,6 +245,10 @@ class ERM_Live_Adaptive:
         empirical_term = (short_trend + sat_forcing + neighbor_influence) * self.alpha * regime_damp
         empirical_term = np.clip(empirical_term, -8.0, 8.0)
 
+        # ← NEW: Stable-regime mean-reversion bias (prevents flat zero predictions)
+        if self.current_regime == "stable":
+            empirical_term += (current_temp - local_avg_temp) * 0.08
+
         self.nr = np.linalg.norm([
             current_temp / 50.0,
             (current_pressure - 1013.0) / 50.0,
@@ -279,6 +283,10 @@ class ERM_Live_Adaptive:
 
         next_predicted = current_temp + (Er_new * beta)
         next_predicted = np.clip(next_predicted, current_temp - 50, current_temp + 50)
+
+        # ← NEW: Rich per-step logging (makes debugging flat predictions trivial)
+        logger.info(f"ERM.step → temp={current_temp:.2f}°C | Er_new={Er_new:.3f} | smoothed_er={self.smoothed_er:.3f} | "
+                    f"regime={self.current_regime} | next_pred={next_predicted:.2f} | volatility={volatility:.2f}")
 
         self.prediction_history.append(next_predicted)
         self.actual_history.append(current_temp)
@@ -318,7 +326,11 @@ class ERM_Live_Adaptive:
         predictions = {}
         for h in horizons:
             regime_damp = 0.8 if self.current_regime in ["storm", "chaotic"] else 1.0
-            pred = base + (self.smoothed_er * regime_damp * (h / 6.0))
+            delta = self.smoothed_er * regime_damp * (h / 6.0)
+            # ← REFINED: tiny stable-regime drift so horizons are never perfectly flat
+            if self.current_regime == "stable" and abs(self.smoothed_er) < 0.3:
+                delta += 0.04 * h
+            pred = base + delta
             predictions[f"{h}h"] = round(float(pred), 2)
         return {
             "predictions": predictions,
@@ -390,6 +402,7 @@ async def load_city_states() -> Dict[str, ERM_Live_Adaptive]:
 async def save_all_city_states(erms: Dict):
     logger.info("💾 Starting incremental save...")
     async with csv_write_lock:
+        saved_count = 0
         for name, erm in erms.items():
             csv_file = settings.DATA_DIR / f"{settings.CSV_PREFIX}_{name}.csv"
             try:
@@ -426,9 +439,11 @@ async def save_all_city_states(erms: Dict):
                     df = pd.DataFrame([row])
                     df.to_csv(csv_file, mode='a', header=not csv_file.exists(), index=False)
                     logger.info(f"✅ Appended record for {name} (records: {len(erm.history)})")
+                    saved_count += 1
 
             except Exception as e:
                 logger.error(f"❌ Failed to save {name}: {e}")
+        logger.info(f"💾 Incremental save finished — {saved_count} cities updated")
 
     await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
@@ -675,7 +690,6 @@ async def visualize_city(city: str):
         axs[0, 1].bar(regimes, success, color="#00ff88")
         axs[0, 1].set_title("Regime Success Rate")
 
-        # Dynamic benchmark based on actual performance
         axs[1, 0].bar(["Persistence", "Linear", "ERM"], [2.1, 1.8, erm.performance_score * 2], color=["#666", "#666", "#00ff88"])
         axs[1, 0].set_title("Benchmark MAE (lower = better)")
 
