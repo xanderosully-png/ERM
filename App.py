@@ -39,7 +39,7 @@ def unit_symbol() -> str:
 
 backend_url = st.sidebar.text_input(
     "Backend URL",
-    value="https://your-main-service.onrender.com",   # ← CHANGE THIS to your actual FastAPI URL
+    value="https://ermforecast.onrender.com",   # ← UPDATED HERE
     help="Point this to your deployed main.py service"
 )
 
@@ -188,7 +188,7 @@ with tab5:
 # ===================== FOOTER =====================
 st.caption(
     f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | "
-    f"Backend: v{settings.VERSION if 'settings' in globals() else '10.0'} | Unit: {unit_symbol()}"
+    f"Backend: v10.0 | Unit: {unit_symbol()}"
 )
 
 if st.button("🔄 Hard Refresh Dashboard", use_container_width=True):
