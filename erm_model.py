@@ -1,4 +1,5 @@
 # erm_model.py (v3 – Mature, Modular, Diurnal-Aware Edition)
+# Compatible with ERM v10.1 backend
 from collections import deque
 import numpy as np
 import math
@@ -8,7 +9,10 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 class ERM_Live_Adaptive:
-    # Tunable constants (all exposed)
+    # ====================== VERSION & TUNABLE CONSTANTS ======================
+    VERSION = "3.0"                     # Model version (independent of backend v10.1)
+
+    # Core hyperparameters (all exposed for easy tuning)
     GAMMA = 0.932
     LAMBDA_DAMP = 0.225
     ALPHA = 0.76
@@ -58,7 +62,7 @@ class ERM_Live_Adaptive:
         self.last_predicted: Optional[float] = None
         self.local_climatology = 15.0
 
-    # ── Private modular helpers (much cleaner now) ──
+    # ── Private modular helpers ──
     def _diurnal_factor(self, hour: int) -> float:
         """Sinusoidal diurnal cycle – strongest effect in stable regimes."""
         return self.DIURNAL_AMPLITUDE * math.sin(2 * math.pi * (hour - 3) / 24.0)
@@ -116,7 +120,7 @@ class ERM_Live_Adaptive:
                 elif success_rate > 0.75:
                     self.alpha = min(0.85, self.alpha * (1 + self.ADAPTATION_RATE * 0.5))
 
-    # ── Main step (now synchronous, modular, and cleaner) ──
+    # ── Main step (synchronous, modular, and clean) ──
     def step(self, current_temp: float, current_humidity: float, current_wind: float,
              current_pressure: float, current_rain_prob: float = 20.0,
              current_cloud_cover: float = 50.0, current_solar: float = 300.0,
@@ -152,7 +156,7 @@ class ERM_Live_Adaptive:
         # Update climatology
         self.local_climatology = self.CLIMATOLOGY_SMOOTH * self.local_climatology + (1 - self.CLIMATOLOGY_SMOOTH) * local_avg_temp
 
-        # Empirical term (now uses diurnal + rain prob lightly)
+        # Empirical term
         sat_forcing = solar_adjust * 0.42 + (blended_cloud / 100.0 - 0.5) * 0.32
         regime_damp = 0.78 if self.current_regime in ["storm", "chaotic"] else 1.0
         empirical = (short_trend + sat_forcing + neighbor_influence) * self.alpha * regime_damp
@@ -160,7 +164,7 @@ class ERM_Live_Adaptive:
         if self.current_regime == "stable":
             empirical += (current_temp - self.local_climatology) * 0.085
             empirical += 0.35 * self._diurnal_factor(hour_of_day)
-            empirical += current_rain_prob * -0.008  # light negative bias when rainy
+            empirical += current_rain_prob * -0.008
 
         # Physics core
         self.nr = self._compute_nr(current_temp, current_pressure, current_humidity, current_wind)
@@ -185,8 +189,8 @@ class ERM_Live_Adaptive:
         next_predicted = current_temp + Er_new * beta
         next_predicted = np.clip(next_predicted, current_temp - 45, current_temp + 45)
 
-        # Tracking & light adaptation
-        logger.info(f"ERM.v3 [{self.city_name}] T={current_temp:.2f}°C Er={Er_new:.3f} regime={self.current_regime} "
+        # Logging & tracking
+        logger.info(f"ERM.v{self.VERSION} [{self.city_name}] T={current_temp:.2f}°C Er={Er_new:.3f} regime={self.current_regime} "
                     f"nr={self.nr:.2f} pred={next_predicted:.2f} vol={volatility:.2f}")
 
         self.Er_history.append(Er_new)
@@ -213,7 +217,7 @@ class ERM_Live_Adaptive:
             self.wind_history.append(wind)
             self.pressure_history.append(pressure)
 
-    # ── Improved future prediction (light recursive simulation) ──
+    # ── Improved future prediction ──
     def predict_future(self, horizons: List[int] = [1, 3, 6, 12, 24]) -> Dict[str, Any]:
         if self.last_predicted is None:
             return {"error": "Not enough data yet"}
@@ -226,10 +230,8 @@ class ERM_Live_Adaptive:
         reversion = 0.038 if self.current_regime == "stable" else 0.014
 
         for h in sorted(set(horizons)):
-            # Mini recursive step
             step_er = current_er * (0.89 ** (h - 1)) * regime_damp
             temp += step_er
-            # Mean-reversion pull toward climatology
             temp += reversion * (self.local_climatology - temp)
             predictions[f"{h}h"] = round(float(np.clip(temp, base - 22, base + 22)), 2)
 
@@ -271,8 +273,8 @@ class ERM_Live_Adaptive:
             "performance_score": round(self.performance_score, 3),
             "regime_tracker": self.regime_tracker,
             "smoothed_er": round(self.smoothed_er, 3),
-            "nr": round(self.nr, 3),
+            "nr": round(self.nr, 3) if hasattr(self, "nr") else None,
             "last_delta_phi": round(self.delta_phi_history[-1], 3) if self.delta_phi_history else None,
             "local_climatology": round(self.local_climatology, 2),
             "history_length": len(self.history)
-      }
+        }
