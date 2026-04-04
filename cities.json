@@ -1,0 +1,146 @@
+[
+  {
+    "name": "Columbus_OH",
+    "lat": 39.9612,
+    "lon": -82.9988,
+    "tz": "America/New_York",
+    "local_avg_temp": 11.5,
+    "local_temp_range": 35.0
+  },
+  {
+    "name": "Miami_FL",
+    "lat": 25.7617,
+    "lon": -80.1918,
+    "tz": "America/New_York",
+    "local_avg_temp": 25.0,
+    "local_temp_range": 15.0
+  },
+  {
+    "name": "New_York_NY",
+    "lat": 40.7128,
+    "lon": -74.0060,
+    "tz": "America/New_York",
+    "local_avg_temp": 12.0,
+    "local_temp_range": 32.0
+  },
+  {
+    "name": "Los_Angeles_CA",
+    "lat": 34.0522,
+    "lon": -118.2437,
+    "tz": "America/Los_Angeles",
+    "local_avg_temp": 18.0,
+    "local_temp_range": 20.0
+  },
+  {
+    "name": "London_UK",
+    "lat": 51.5074,
+    "lon": -0.1278,
+    "tz": "Europe/London",
+    "local_avg_temp": 11.0,
+    "local_temp_range": 25.0
+  },
+  {
+    "name": "Tokyo_JP",
+    "lat": 35.6895,
+    "lon": 139.6917,
+    "tz": "Asia/Tokyo",
+    "local_avg_temp": 16.0,
+    "local_temp_range": 28.0
+  },
+  {
+    "name": "Pataskala_OH",
+    "lat": 39.9956,
+    "lon": -82.6743,
+    "tz": "America/New_York",
+    "local_avg_temp": 12.5,
+    "local_temp_range": 22.0
+  },
+  {
+    "name": "Cleveland_OH",
+    "lat": 41.4993,
+    "lon": -81.6944,
+    "tz": "America/New_York",
+    "local_avg_temp": 10.5,
+    "local_temp_range": 19.0
+  },
+  {
+    "name": "Fort_Lauderdale_FL",
+    "lat": 26.1224,
+    "lon": -80.1373,
+    "tz": "America/New_York",
+    "local_avg_temp": 25.5,
+    "local_temp_range": 14.0
+  },
+  {
+    "name": "West_Palm_Beach_FL",
+    "lat": 26.7153,
+    "lon": -80.0534,
+    "tz": "America/New_York",
+    "local_avg_temp": 25.0,
+    "local_temp_range": 15.0
+  },
+  {
+    "name": "Philadelphia_PA",
+    "lat": 39.9526,
+    "lon": -75.1652,
+    "tz": "America/New_York",
+    "local_avg_temp": 12.5,
+    "local_temp_range": 31.0
+  },
+  {
+    "name": "Boston_MA",
+    "lat": 42.3601,
+    "lon": -71.0589,
+    "tz": "America/New_York",
+    "local_avg_temp": 11.0,
+    "local_temp_range": 33.0
+  },
+  {
+    "name": "San_Diego_CA",
+    "lat": 32.7157,
+    "lon": -117.1611,
+    "tz": "America/Los_Angeles",
+    "local_avg_temp": 18.5,
+    "local_temp_range": 18.0
+  },
+  {
+    "name": "San_Francisco_CA",
+    "lat": 37.7749,
+    "lon": -122.4194,
+    "tz": "America/Los_Angeles",
+    "local_avg_temp": 15.0,
+    "local_temp_range": 22.0
+  },
+  {
+    "name": "Manchester_UK",
+    "lat": 53.4808,
+    "lon": -2.2426,
+    "tz": "Europe/London",
+    "local_avg_temp": 10.5,
+    "local_temp_range": 24.0
+  },
+  {
+    "name": "Birmingham_UK",
+    "lat": 52.4862,
+    "lon": -1.8904,
+    "tz": "Europe/London",
+    "local_avg_temp": 11.0,
+    "local_temp_range": 25.0
+  },
+  {
+    "name": "Yokohama_JP",
+    "lat": 35.4437,
+    "lon": 139.6380,
+    "tz": "Asia/Tokyo",
+    "local_avg_temp": 16.0,
+    "local_temp_range": 27.0
+  },
+  {
+    "name": "Osaka_JP",
+    "lat": 34.6937,
+    "lon": 135.5023,
+    "tz": "Asia/Tokyo",
+    "local_avg_temp": 16.5,
+    "local_temp_range": 28.0
+  }
+]
