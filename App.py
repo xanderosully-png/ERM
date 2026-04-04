@@ -7,13 +7,13 @@ from datetime import datetime
 from typing import Optional
 
 st.set_page_config(
-    page_title="ERM v9.1 — Truth Detector",
+    page_title="ERM v10.0 — Truth Detector",
     layout="wide",
     page_icon="🌍",
     initial_sidebar_state="expanded"
 )
 
-# ===================== SESSION STATE & UNIT SELECTOR =====================
+# ===================== SESSION STATE =====================
 if "unit" not in st.session_state:
     st.session_state.unit = "F"
 if "selected_city" not in st.session_state:
@@ -25,8 +25,7 @@ unit_choice = st.sidebar.radio(
     "Temperature Unit",
     options=["Fahrenheit (°F)", "Celsius (°C)"],
     index=0 if st.session_state.unit == "F" else 1,
-    horizontal=True,
-    help="Changes are applied instantly across the entire dashboard"
+    horizontal=True
 )
 st.session_state.unit = "F" if "F" in unit_choice else "C"
 
@@ -40,8 +39,8 @@ def unit_symbol() -> str:
 
 backend_url = st.sidebar.text_input(
     "Backend URL",
-    value="https://ermforecast.onrender.com",
-    help="Change only if you are running a local backend"
+    value="http://localhost:8000",
+    help="Point this to your main.py FastAPI backend"
 )
 
 refresh_interval = st.sidebar.slider(
@@ -49,12 +48,11 @@ refresh_interval = st.sidebar.slider(
     min_value=30,
     max_value=300,
     value=60,
-    step=15,
-    help="Dashboard will auto-refresh at this interval"
+    step=15
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("ERM v9.1 • Self-Evolving Truth Detector")
+st.sidebar.caption("ERM v10.0 • Self-Evolving Truth Detector")
 
 # ===================== DEFAULT CITIES =====================
 DEFAULT_CITIES = [
@@ -88,14 +86,14 @@ def fetch_visualization(url: str, city: str):
     try:
         r = requests.get(f"{url}/visualize/{city}", timeout=15)
         r.raise_for_status()
-        return r.json().get("visualization", {})
+        return r.text  # returns full Plotly HTML
     except Exception as e:
-        return {"error": str(e)}
+        return f"<h3 style='color:red'>Visualization error: {e}</h3>"
 
-# ===================== MAIN HEADER =====================
+# ===================== HEADER =====================
 st.markdown("""
 <h1 style='text-align:center; color:#00ff88; margin-bottom:0;'>
-    🌍 ERM v9.1 — Truth Detector
+    🌍 ERM v10.0 — Truth Detector
 </h1>
 <p style='text-align:center; color:#aaaaaa; font-size:1.1em;'>
     Self-evolving • Regime-aware • Beats every baseline
@@ -136,88 +134,61 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 with tab1:
     st.subheader("1. Reality vs Prediction")
-    if not selected_city:
-        st.info("👆 Select a city above")
-    else:
-        latest = fetch_latest(backend_url, selected_city)
-        pred_data = fetch_predict(backend_url, selected_city)
+    latest = fetch_latest(backend_url, selected_city)
+    pred_data = fetch_predict(backend_url, selected_city)
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            current_temp = latest.get("current_temp") if latest else None
-            st.metric("Current Actual Temperature", f"{convert_temp(current_temp)} {unit_symbol()}")
-        with col2:
-            one_hour_pred = pred_data.get("predictions", {}).get("1h") if pred_data and "predictions" in pred_data else None
-            pred_display = convert_temp(one_hour_pred)
-            st.metric("ERM 1‑Hour Prediction", f"{pred_display} {unit_symbol()}")
-        with col3:
-            confidence = pred_data.get("confidence", "N/A") if pred_data else "N/A"
-            st.metric("Prediction Confidence", f"{confidence}%")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        current_temp = latest.get("current_temp") if latest else None
+        st.metric("Current Actual Temperature", f"{convert_temp(current_temp)} {unit_symbol()}")
+    with col2:
+        one_hour_pred = pred_data.get("predictions", {}).get("1h") if pred_data and "predictions" in pred_data else None
+        st.metric("ERM 1‑Hour Prediction", f"{convert_temp(one_hour_pred)} {unit_symbol()}")
+    with col3:
+        confidence = pred_data.get("confidence", "N/A") if pred_data else "N/A"
+        st.metric("Prediction Confidence", f"{confidence}%")
 
-        # Multi-horizon table
-        if pred_data and "predictions" in pred_data:
-            horizons = ["1h", "3h", "6h", "12h", "24h"]
-            preds = [pred_data["predictions"].get(h) for h in horizons]
-            preds_display = [convert_temp(p) for p in preds]
-            confs = [confidence] * len(horizons)
+    if pred_data and "predictions" in pred_data:
+        horizons = ["1h", "3h", "6h", "12h", "24h"]
+        preds = [pred_data["predictions"].get(h) for h in horizons]
+        preds_display = [convert_temp(p) for p in preds]
+        confs = [confidence] * len(horizons)
 
-            df_pred = pd.DataFrame({
-                "Horizon": horizons,
-                f"Prediction ({unit_symbol()})": preds_display,
-                "Confidence (%)": confs
-            })
-            st.dataframe(df_pred, use_container_width=True, hide_index=True)
-
-        # Snapshot chart
-        fig = make_subplots(rows=1, cols=1)
-        actual = latest.get("current_temp") if latest else 0
-        pred_c = pred_data.get("predictions", {}).get("1h") if pred_data and "predictions" in pred_data else 0
-        fig.add_trace(go.Scatter(x=[1], y=[actual], mode="markers+text", name="Actual", text="Actual", marker=dict(color="#00ff88", size=18)))
-        fig.add_trace(go.Scatter(x=[2], y=[pred_c], mode="markers+text", name="ERM", text="ERM", marker=dict(color="#ffaa00", size=18)))
-        fig.update_layout(title="Reality vs ERM Prediction (Snapshot)", xaxis=dict(showticklabels=False), yaxis_title=f"Temperature ({unit_symbol()})", height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        df_pred = pd.DataFrame({
+            "Horizon": horizons,
+            f"Prediction ({unit_symbol()})": preds_display,
+            "Confidence (%)": confs
+        })
+        st.dataframe(df_pred, use_container_width=True, hide_index=True)
 
 with tab2:
     st.subheader("2. Error Evolution")
-    st.info("📈 Historical MAE / RMSE trends will populate automatically after multiple update cycles.")
+    st.info("Historical error trends will appear after multiple update cycles.")
 
 with tab3:
     st.subheader("3. Diagnostics")
-    if selected_city:
-        latest = fetch_latest(backend_url, selected_city)
-        if latest:
-            st.metric("Current Regime", latest.get("current_regime", "N/A"))
-            st.metric("Performance Score", f"{latest.get('performance_score', 'N/A')}")
-        else:
-            st.info("Waiting for prediction data...")
+    if latest:
+        st.metric("Current Regime", latest.get("current_regime", "N/A"))
+        st.metric("Performance Score", f"{latest.get('performance_score', 'N/A')}")
     else:
-        st.info("Select a city above")
+        st.info("No data yet — run an update first.")
 
 with tab4:
-    st.subheader("4. Live Visualizations (matplotlib)")
+    st.subheader("4. Live Visualizations (Plotly)")
     if selected_city:
-        viz_data = fetch_visualization(backend_url, selected_city)
-        if "error" in viz_data:
-            st.error(viz_data["error"])
-        elif "dashboard_png_base64" in viz_data:
-            st.image(
-                f"data:image/png;base64,{viz_data['dashboard_png_base64']}",
-                use_container_width=True
-            )
-            st.caption("📊 Real-time ERM v9.1 dashboard: history, regime performance, benchmark MAE, rolling confidence")
-        else:
-            st.warning("Visualization not ready yet — run a few updates first")
+        viz_html = fetch_visualization(backend_url, selected_city)
+        st.components.v1.html(viz_html, height=700, scrolling=True)
     else:
         st.info("Select a city above")
 
 with tab5:
     st.subheader("5. Benchmarks & Self-Evolution")
-    st.info("Benchmark data appears after several update cycles")
+    st.info("Benchmark data appears after several update cycles.")
 
 # ===================== FOOTER =====================
 st.caption(
     f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | "
-    f"Backend: v9.1 | Unit: {unit_symbol()}"
+    f"Backend: v{settings.VERSION if 'settings' in globals() else '10.0'} | Unit: {unit_symbol()}"
 )
 
 if st.button("🔄 Hard Refresh Dashboard", use_container_width=True):
