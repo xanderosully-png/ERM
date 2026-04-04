@@ -1,13 +1,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import requests
 from datetime import datetime
 from typing import Optional
 
 st.set_page_config(
-    page_title="ERM v10.0 — Truth Detector",
+    page_title="ERM v10.1 — Truth Detector",
     layout="wide",
     page_icon="🌍",
     initial_sidebar_state="expanded"
@@ -58,7 +57,7 @@ refresh_interval = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("ERM v10.0 • Self-Evolving Truth Detector")
+st.sidebar.caption("ERM v10.1 • Self-Evolving Truth Detector")
 
 # ===================== DEFAULT CITIES =====================
 DEFAULT_CITIES = [
@@ -94,12 +93,12 @@ def fetch_visualization(url: str, city: str):
         r.raise_for_status()
         return r.text
     except Exception as e:
-        return f"<h3 style='color:red'>Visualization error: {e}</h3>"
+        return f"<h3 style='color:#ffaa00'>Could not load chart (backend may be waking up): {e}</h3>"
 
 # ===================== HEADER =====================
 st.markdown("""
 <h1 style='text-align:center; color:#00ff88; margin-bottom:0;'>
-    🌍 ERM v10.0 — Truth Detector
+    🌍 ERM v10.1 — Truth Detector
 </h1>
 <p style='text-align:center; color:#aaaaaa; font-size:1.1em;'>
     Self-evolving • Regime-aware • Beats every baseline
@@ -183,7 +182,8 @@ with tab4:
     st.subheader("4. Live Visualizations (Plotly)")
     if selected_city:
         viz_html = fetch_visualization(backend_url, selected_city)
-        st.components.v1.html(viz_html, height=700, scrolling=True)
+        # Fixed: use st.iframe instead of deprecated st.components.v1.html
+        st.iframe(viz_html, height=700, scrolling=True)
     else:
         st.info("Select a city above")
 
@@ -194,7 +194,7 @@ with tab5:
 # ===================== FOOTER =====================
 st.caption(
     f"Last refreshed: {datetime.now().strftime('%H:%M:%S')} | "
-    f"Backend: v10.0 | Unit: {unit_symbol()} | "
+    f"Backend: v10.1 | Unit: {unit_symbol()} | "
     f"Connected to: {backend_url}"
 )
 
