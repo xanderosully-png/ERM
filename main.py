@@ -15,15 +15,13 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 import math
-import base64
-from io import BytesIO
 import json
 import sqlite3
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 import plotly.graph_objects as go
 import plotly.io as pio
 
-# Phase 1: Modular ERM v3 model
+# Phase 1: Modular ERM v3 model (unchanged)
 from erm_model import ERM_Live_Adaptive
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -38,8 +36,8 @@ class Settings:
     VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
     RATE_LIMIT_WINDOW = 45.0
-    VERSION = "10.0"
-    CSV_PREFIX = "erm_v9.0"
+    VERSION = "10.1"                    # ← updated
+    CSV_PREFIX = "erm_v10.0"            # ← updated for v10.1
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
     AUTO_UPDATE_INTERVAL_MIN = 10
@@ -294,7 +292,7 @@ async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
         data[name] = result if isinstance(result, dict) else {"temp": 15.0, "humidity": 50.0, "wind": 5.0, "pressure": 1013.0, "rain_prob": 0.0, "cloud_cover": 30.0, "solar": 400.0, "wind_dir": 180.0}
     return data
 
-# ===================== CORE UPDATE LOGIC (FIXED) =====================
+# ===================== CORE UPDATE LOGIC =====================
 async def _perform_city_updates(force_update: bool = False):
     logger.info("🚀 Starting optimized simultaneous update cycle")
     cities = app.state.cities_config
@@ -313,7 +311,6 @@ async def _perform_city_updates(force_update: bool = False):
         name = city["name"]
         ground = live_data.get(name, {})
 
-        # Bypass rate limiter when manually triggered from dashboard
         if not force_update:
             now = datetime.now().timestamp()
             async with rate_limiter_lock:
@@ -362,7 +359,8 @@ async def _perform_city_updates(force_update: bool = False):
         "timestamp": datetime.utcnow().isoformat(),
         "model": "ERM_v3",
         "cities_updated": updated_count,
-        "total_cities": len(cities)
+        "total_cities": len(cities),
+        "version": settings.VERSION
     }
 
 # ===================== LIFESPAN =====================
@@ -388,7 +386,7 @@ async def lifespan(app: FastAPI):
     app.state.cleanup_task = asyncio.create_task(cleanup_rate_limiter())
     app.state.auto_update_task = asyncio.create_task(periodic_auto_update())
 
-    logger.info(f"🚀 ERM v{settings.VERSION} (full Phase 6 — back-testing + metrics + Plotly cache) started")
+    logger.info(f"🚀 ERM v{settings.VERSION} started successfully")
     yield
 
     for task_name in ('save_task', 'cleanup_task', 'auto_update_task'):
@@ -405,7 +403,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=f"ERM Live Update Service — v{settings.VERSION}", lifespan=lifespan)
 
-# ===================== LOAD CITY STATES =====================
+# ===================== LOAD / SAVE CITY STATES =====================
 async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
     erms = {}
     conn = sqlite3.connect(settings.DB_PATH)
@@ -417,8 +415,7 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
             conn, params=(name, settings.MAX_CSV_LOAD_RECORDS)
         )
         if not df.empty:
-            logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite (chronological order)")
-
+            logger.info(f"✅ Loaded {len(df)} records for {name} from SQLite")
             for _, row in df.iterrows():
                 erm.history.append(row["temp"])
                 erm.humidity_history.append(row.get("humidity", 50.0))
@@ -433,12 +430,6 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
             if len(df) > 0:
                 erm.last_predicted = float(df.iloc[-1]["temp"])
 
-            try:
-                replay_result = erm.replay_history(list(erm.history))
-                logger.info(f"🔄 Replayed {replay_result['steps']} historical steps for {name} (final regime: {replay_result['final_regime']})")
-            except Exception as e:
-                logger.warning(f"⚠️ History replay failed for {name} (non-fatal): {e}")
-
         else:
             logger.info(f"No records yet for {name} — starting fresh")
 
@@ -447,7 +438,6 @@ async def load_city_states(cities: List[Dict]) -> Dict[str, ERM_Live_Adaptive]:
     conn.close()
     return erms
 
-# ===================== SAVE ALL CITY STATES =====================
 async def save_all_city_states(erms: Dict):
     logger.info("💾 Saving to SQLite...")
     conn = sqlite3.connect(settings.DB_PATH)
@@ -482,7 +472,7 @@ async def save_all_city_states(erms: Dict):
     logger.info(f"✅ Saved {saved_count} cities to SQLite")
     await async_git_backup(settings.DATA_DIR, settings.STATE_DIR)
 
-# ===================== GIT BACKUP =====================
+# ===================== GIT BACKUP (unchanged) =====================
 async def run_git_command(args: list[str], cwd: Path, check: bool = True) -> int:
     cmd = ["git"] + args
     try:
@@ -583,7 +573,7 @@ class HealthResponse(BaseModel):
     version: str
     uptime: str = "running"
 
-# ===================== UPDATE ENDPOINT (with force_update) =====================
+# ===================== ENDPOINTS =====================
 @app.get("/update")
 async def update_all_cities():
     try:
@@ -592,7 +582,6 @@ async def update_all_cities():
         logger.error(f"Update failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ===================== ANOMALY + BACKTEST + METRICS =====================
 @app.get("/anomalies")
 async def get_anomalies():
     return {
@@ -633,7 +622,6 @@ async def metrics():
         "uptime": "running"
     }
 
-# ===================== PLOTLY VISUALIZATION WITH CACHE =====================
 @app.get("/visualize/{city}")
 async def visualize_city(city: str):
     erm = app.state.per_city_erms.get(city) if hasattr(app.state, 'per_city_erms') else None
@@ -672,7 +660,6 @@ async def visualize_city(city: str):
     cache_file.write_text(html_str, encoding="utf-8")
     return HTMLResponse(html_str)
 
-# ===================== DASHBOARD ENDPOINTS =====================
 @app.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(status="healthy", version=settings.VERSION)
