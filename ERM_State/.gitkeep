@@ -1,0 +1,3 @@
+# This folder is intentionally kept in Git for any future state files.
+# Currently unused (we use SQLite instead), but kept for structure.
+# Do not delete this .gitkeep file.
