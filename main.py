@@ -17,6 +17,7 @@ from typing import List, Dict, Optional
 import math
 import json
 import sqlite3
+import time   # ← Added for delay between fetches
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -35,12 +36,12 @@ class Settings:
     DB_PATH = Path(__file__).parent / "ERM_Data" / "erm_data.db"
     VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
-    RATE_LIMIT_WINDOW = 30.0   # ← Lowered temporarily for faster testing
+    RATE_LIMIT_WINDOW = 45.0
     VERSION = "10.1"
     CSV_PREFIX = "erm_v10.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
-    AUTO_UPDATE_INTERVAL_MIN = 15
+    AUTO_UPDATE_INTERVAL_MIN = 20   # ← Increased to 20 minutes for stability
     MAX_CSV_LOAD_RECORDS = 100
 
     ANOMALY_ER_THRESHOLD = 0.80
@@ -268,7 +269,6 @@ async def migrate_from_csvs():
     ),
 )
 def fetch_city_data(city: Dict) -> Dict:
-    """Synchronous Open-Meteo fetch with full diagnostics."""
     name = city.get("name", "Unknown")
 
     if circuit_breaker.is_open():
@@ -318,12 +318,13 @@ def fetch_city_data(city: Dict) -> Dict:
         return get_dummy_data(name)
 
 def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
-    """Sequential synchronous fetch — now only called for cities that actually need updating."""
+    """Sequential synchronous fetch with delay to respect Open-Meteo rate limits."""
     data = {}
     for city in cities:
         result = fetch_city_data(city)
         name = city["name"]
         data[name] = result
+        time.sleep(2.0)   # ← 2-second delay between cities (critical fix)
     return data
 
 # ===================== CORE UPDATE LOGIC =====================
@@ -331,7 +332,6 @@ async def _perform_city_updates(force_update: bool = False):
     logger.info("🚀 Starting optimized simultaneous update cycle")
     cities = app.state.cities_config
 
-    # Filter cities that actually need updating BEFORE any network calls
     cities_to_update = []
     now = datetime.now().timestamp()
     for city in cities:
@@ -765,7 +765,6 @@ async def reset_circuit_breaker():
 
 @app.get("/trigger-fetch")
 async def trigger_fetch():
-    """Manually trigger fetch and see exactly what happens to each city"""
     try:
         cities = app.state.cities_config
         results = []
