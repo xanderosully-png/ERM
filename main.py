@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ import traceback
 from datetime import datetime
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 import math
 import json
 import sqlite3
@@ -35,12 +35,12 @@ class Settings:
     DB_PATH = Path(__file__).parent / "ERM_Data" / "erm_data.db"
     VISUALIZATION_CACHE_DIR = Path(__file__).parent / "ERM_Data" / "visualizations"
 
-    RATE_LIMIT_WINDOW = 45.0
+    RATE_LIMIT_WINDOW = 30.0   # ← Lowered temporarily for faster testing
     VERSION = "10.1"
     CSV_PREFIX = "erm_v10.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
-    AUTO_UPDATE_INTERVAL_MIN = 15   # ← Changed to 15 minutes for even lighter operation and fewer cold starts on Render free tier
+    AUTO_UPDATE_INTERVAL_MIN = 15
     MAX_CSV_LOAD_RECORDS = 100
 
     ANOMALY_ER_THRESHOLD = 0.80
@@ -260,7 +260,7 @@ async def migrate_from_csvs():
 # ===================== RESILIENT FETCH =====================
 @retry(
     stop=stop_after_attempt(settings.MAX_RETRIES),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
+    wait=wait_exponential(multiplier=1, min=2, max=15),
     retry=retry_if_exception(lambda e: True),
     before=lambda retry_state: logger.info(
         f"🔄 Retrying Open-Meteo fetch for {retry_state.args[0].get('name', 'Unknown')} "
@@ -268,7 +268,7 @@ async def migrate_from_csvs():
     ),
 )
 def fetch_city_data(city: Dict) -> Dict:
-    """Synchronous Open-Meteo fetch with full resilience."""
+    """Synchronous Open-Meteo fetch with full diagnostics."""
     name = city.get("name", "Unknown")
 
     if circuit_breaker.is_open():
@@ -290,10 +290,11 @@ def fetch_city_data(city: Dict) -> Dict:
         r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
         r.raise_for_status()
         current = r.json()["current"]
-        logger.info(f"✅ SUCCESS: Fetched live data for {name} → Temp = {current.get('temperature_2m')}°C")
+        temp = float(current.get("temperature_2m", 15.0))
+        logger.info(f"✅ SUCCESS: Fetched live data for {name} → Temp = {temp}°C")
         circuit_breaker.record_success()
         return {
-            "temp": float(current.get("temperature_2m", 15.0)),
+            "temp": temp,
             "humidity": float(current.get("relative_humidity_2m", 50.0)),
             "wind": float(current.get("wind_speed_10m", 5.0)),
             "pressure": float(current.get("pressure_msl", 1013.0)),
@@ -303,11 +304,16 @@ def fetch_city_data(city: Dict) -> Dict:
             "wind_dir": float(current.get("wind_direction_10m", 180.0)),
             "source": "open-meteo"
         }
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            logger.error(f"❌ RATE LIMIT (429) hit for {name} — Open-Meteo is throttling this IP")
+        else:
+            logger.error(f"❌ HTTP error for {name}: {e.response.status_code} - {e.response.text[:200]}")
+        circuit_breaker.record_failure()
+        return get_dummy_data(name)
     except Exception as e:
         error_msg = f"❌ Open-Meteo fetch FAILED for {name}: {type(e).__name__} - {str(e)}"
         logger.error(error_msg)
-        if isinstance(e, requests.exceptions.HTTPError):
-            logger.error(f"   Response status: {e.response.status_code} | Body: {e.response.text[:300]}")
         circuit_breaker.record_failure()
         return get_dummy_data(name)
 
@@ -325,7 +331,7 @@ async def _perform_city_updates(force_update: bool = False):
     logger.info("🚀 Starting optimized simultaneous update cycle")
     cities = app.state.cities_config
 
-    # NEW: Filter cities that actually need updating BEFORE any network calls
+    # Filter cities that actually need updating BEFORE any network calls
     cities_to_update = []
     now = datetime.now().timestamp()
     for city in cities:
@@ -360,7 +366,6 @@ async def _perform_city_updates(force_update: bool = False):
         name = city["name"]
         ground = live_data.get(name, {})
 
-        # update rate limiter timestamp
         async with rate_limiter_lock:
             city_last_request[name] = datetime.now().timestamp()
 
