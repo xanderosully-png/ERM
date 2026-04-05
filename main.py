@@ -5,7 +5,7 @@ from pydantic import BaseModel
 import uvicorn
 import os
 import numpy as np
-import httpx
+import requests
 import asyncio
 import pandas as pd
 import logging
@@ -88,6 +88,21 @@ class CircuitBreaker:
         return self.open
 
 circuit_breaker = CircuitBreaker()
+
+# ===================== DUMMY DATA HELPER =====================
+def get_dummy_data(name: str) -> Dict:
+    logger.warning(f"⚠️ Using dummy data for {name} (fetch failed or circuit breaker open)")
+    return {
+        "temp": 15.0,
+        "humidity": 50.0,
+        "wind": 5.0,
+        "pressure": 1013.0,
+        "rain_prob": 0.0,
+        "cloud_cover": 30.0,
+        "solar": 400.0,
+        "wind_dir": 180.0,
+        "source": "dummy"
+    }
 
 # ===================== CITY CONFIG + NEIGHBOR GRAPH =====================
 def load_cities_config() -> List[Dict]:
@@ -180,7 +195,6 @@ class AnomalyTracker:
 city_last_request: Dict[str, float] = {}
 rate_limiter_lock = asyncio.Lock()
 git_backup_lock = asyncio.Lock()
-http_client: Optional[httpx.AsyncClient] = None
 anomaly_tracker = AnomalyTracker()
 
 # ===================== SQLITE HELPERS =====================
@@ -243,18 +257,28 @@ async def migrate_from_csvs():
     if migrated:
         logger.info(f"✅ Migration complete — {migrated} cities moved to SQLite")
 
-# ===================== RESILIENT FETCH (with delay to prevent 429) =====================
+# ===================== RESILIENT FETCH =====================
 @retry(
     stop=stop_after_attempt(settings.MAX_RETRIES),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception(lambda e: isinstance(e, (httpx.RequestError, httpx.HTTPStatusError))),
-    reraise=True
+    retry=retry_if_exception(lambda e: True),
+    before=lambda retry_state: logger.info(
+        f"🔄 Retrying Open-Meteo fetch for {retry_state.args[0].get('name', 'Unknown')} "
+        f"(attempt {retry_state.attempt_number}/{settings.MAX_RETRIES})"
+    ),
 )
-async def fetch_city_data(city: Dict) -> Dict:
+def fetch_city_data(city: Dict) -> Dict:
+    """Synchronous Open-Meteo fetch with full resilience."""
+    name = city.get("name", "Unknown")
+
     if circuit_breaker.is_open():
-        logger.warning(f"⛔ Circuit breaker open — skipping fetch for {city['name']}")
-        return {}
-    name = city["name"]
+        logger.warning(f"🚦 Circuit breaker OPEN — skipping API call for {name}")
+        return get_dummy_data(name)
+
+    if "lat" not in city or "lon" not in city:
+        logger.error(f"❌ City {name} missing lat/lon in cities.json")
+        return get_dummy_data(name)
+
     try:
         params = {
             "latitude": city["lat"],
@@ -262,10 +286,11 @@ async def fetch_city_data(city: Dict) -> Dict:
             "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,pressure_msl,precipitation_probability,cloud_cover,shortwave_radiation,wind_direction_10m",
             "timezone": "auto",
         }
-        r = await http_client.get("https://api.open-meteo.com/v1/forecast", params=params)
+        logger.info(f"🌍 Fetching live data for {name}...")
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=15)
         r.raise_for_status()
         current = r.json()["current"]
-        logger.info(f"✅ Fetched live data for {name}")
+        logger.info(f"✅ SUCCESS: Fetched live data for {name} → Temp = {current.get('temperature_2m')}°C")
         circuit_breaker.record_success()
         return {
             "temp": float(current.get("temperature_2m", 15.0)),
@@ -276,29 +301,54 @@ async def fetch_city_data(city: Dict) -> Dict:
             "cloud_cover": float(current.get("cloud_cover", 30.0)),
             "solar": float(current.get("shortwave_radiation", 400.0)),
             "wind_dir": float(current.get("wind_direction_10m", 180.0)),
+            "source": "open-meteo"
         }
     except Exception as e:
+        error_msg = f"❌ Open-Meteo fetch FAILED for {name}: {type(e).__name__} - {str(e)}"
+        logger.error(error_msg)
+        if isinstance(e, requests.exceptions.HTTPError):
+            logger.error(f"   Response status: {e.response.status_code} | Body: {e.response.text[:300]}")
         circuit_breaker.record_failure()
-        logger.warning(f"❌ Fetch failed for {name}: {e}")
-        raise
+        return get_dummy_data(name)
 
-async def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
+def fetch_multi_variable_data(cities: List[Dict]) -> Dict[str, Dict]:
+    """Sequential synchronous fetch — now only called for cities that actually need updating."""
     data = {}
-    for city in cities:  # Sequential with small delay to avoid 429
-        result = await fetch_city_data(city)
+    for city in cities:
+        result = fetch_city_data(city)
         name = city["name"]
-        data[name] = result if isinstance(result, dict) else {"temp": 15.0, "humidity": 50.0, "wind": 5.0, "pressure": 1013.0, "rain_prob": 0.0, "cloud_cover": 30.0, "solar": 400.0, "wind_dir": 180.0}
-        await asyncio.sleep(0.6)  # ← prevents rate limit
+        data[name] = result
     return data
 
 # ===================== CORE UPDATE LOGIC =====================
 async def _perform_city_updates(force_update: bool = False):
     logger.info("🚀 Starting optimized simultaneous update cycle")
     cities = app.state.cities_config
-    live_data = await fetch_multi_variable_data(cities)
+
+    # NEW: Filter cities that actually need updating BEFORE any network calls
+    cities_to_update = []
+    now = datetime.now().timestamp()
+    for city in cities:
+        name = city["name"]
+        if force_update or (now - city_last_request.get(name, 0) >= settings.RATE_LIMIT_WINDOW):
+            cities_to_update.append(city)
+        else:
+            logger.info(f"⏭️ Rate-limited skip for {name} (no fetch needed)")
+
+    if not cities_to_update:
+        logger.info("✅ All cities rate-limited — nothing to do")
+        return {
+            "status": "skipped",
+            "timestamp": datetime.utcnow().isoformat(),
+            "cities_updated": 0,
+            "total_cities": len(cities),
+            "message": "All cities still within rate limit window"
+        }
+
+    live_data = fetch_multi_variable_data(cities_to_update)
 
     neighbor_influences = {}
-    for city in cities:
+    for city in cities_to_update:
         name = city["name"]
         ground = live_data.get(name, {})
         wind_dir = ground.get("wind_dir", 180.0)
@@ -306,17 +356,13 @@ async def _perform_city_updates(force_update: bool = False):
         neighbor_influences[name] = sum(neighbor_weight_enhanced(name, n, cities, wind_dir) for n in neighbors)
 
     updated_count = 0
-    for city in cities:
+    for city in cities_to_update:
         name = city["name"]
         ground = live_data.get(name, {})
 
-        if not force_update:
-            now = datetime.now().timestamp()
-            async with rate_limiter_lock:
-                if now - city_last_request.get(name, 0) < settings.RATE_LIMIT_WINDOW:
-                    logger.info(f"⏭️ Rate-limited skip for {name}")
-                    continue
-                city_last_request[name] = now
+        # update rate limiter timestamp
+        async with rate_limiter_lock:
+            city_last_request[name] = datetime.now().timestamp()
 
         erm = app.state.per_city_erms.get(name)
         if not erm:
@@ -365,7 +411,6 @@ async def _perform_city_updates(force_update: bool = False):
 # ===================== LIFESPAN =====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
     for d in (settings.DATA_DIR, settings.STATE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -375,8 +420,6 @@ async def lifespan(app: FastAPI):
     cities = load_cities_config()
     app.state.cities_config = cities
     app.state.neighbor_graph = build_neighbor_graph(cities)
-
-    http_client = httpx.AsyncClient(timeout=8.0, limits=httpx.Limits(max_connections=20))
 
     app.state.per_city_erms = await load_city_states(cities)
     app.state.anomaly_tracker = anomaly_tracker
@@ -396,8 +439,6 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
-    if http_client:
-        await http_client.aclose()
     logger.info("🛑 ERM shutdown complete")
 
 app = FastAPI(title=f"ERM Live Update Service — v{settings.VERSION}", lifespan=lifespan)
@@ -716,6 +757,35 @@ async def reset_circuit_breaker():
     circuit_breaker.open = False
     logger.info("🔄 Circuit breaker manually reset")
     return {"status": "circuit breaker reset", "open": False}
+
+@app.get("/trigger-fetch")
+async def trigger_fetch():
+    """Manually trigger fetch and see exactly what happens to each city"""
+    try:
+        cities = app.state.cities_config
+        results = []
+        live_data = fetch_multi_variable_data(cities)
+        
+        for city in cities:
+            name = city["name"]
+            data = live_data.get(name, {})
+            source = data.get("source", "unknown")
+            temp = data.get("temp", 15.0)
+            results.append({
+                "city": name,
+                "temperature": temp,
+                "source": source,
+                "status": "success" if source == "open-meteo" else "dummy"
+            })
+        
+        return {
+            "message": "Manual fetch completed",
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+            "using_real_data": any(r["status"] == "success" for r in results)
+        }
+    except Exception as e:
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
