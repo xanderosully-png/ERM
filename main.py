@@ -498,7 +498,7 @@ async def async_git_backup(data_dir: Path, state_dir: Path):
             await run_git_command(["config", "--global", "user.email", "erm-bot@render.com"], cwd)
             await run_git_command(["config", "--global", "user.name", "ERM Render Bot"], cwd)
             remote_url = f"https://{token}@github.com/{repo}.git"
-            await run_git_command(["remote", "set-url", "origin", remote_url"], cwd, check=False)
+            await run_git_command(["remote", "set-url", "origin", remote_url], cwd, check=False)
             await run_git_command(["pull", "origin", "main", "--rebase"], cwd, check=False)
 
             await run_git_command(["add", "-A"], cwd)
