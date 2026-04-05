@@ -42,3 +42,4 @@ requests>=2.32.0
 # • Plotly pinned to 6.6.0 to match your dashboard exactly
 # • All packages tested together with Python 3.12
 # =============================================
+requests==2.32.3
