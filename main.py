@@ -40,7 +40,7 @@ class Settings:
     CSV_PREFIX = "erm_v10.0"
     HISTORY_SIZE = 24
     SAVE_INTERVAL_SEC = 300
-    AUTO_UPDATE_INTERVAL_MIN = 10
+    AUTO_UPDATE_INTERVAL_MIN = 15   # ← Changed to 15 minutes for even lighter operation and fewer cold starts on Render free tier
     MAX_CSV_LOAD_RECORDS = 100
 
     ANOMALY_ER_THRESHOLD = 0.80
